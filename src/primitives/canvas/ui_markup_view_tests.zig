@@ -216,6 +216,24 @@ test "markup view builds the same tree as the hand-written view" {
     );
 }
 
+test "digit-only text attributes stay text while numeric attributes stay numeric" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var view = try InboxMarkup.init(
+        arena,
+        "<column padding=\"8\">\n  <text-field placeholder=\"123\" label=\"456\" />\n</column>",
+    );
+    var ui = InboxUi.init(arena);
+    const tree = try ui.finalize(try view.build(&ui, &Model{}));
+    const field = findByKind(tree.root, .text_field).?;
+
+    try testing.expectEqualStrings("123", field.placeholder);
+    try testing.expectEqualStrings("456", field.semantics.label);
+    try testing.expectEqual(@as(f32, 8), tree.root.layout.padding.top);
+}
+
 test "markup keyed rows keep ids across model changes and filters dispatch" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -1433,6 +1451,7 @@ test "the registry's attr value classes match the ElementOptions field types" {
             .optional => |optional| switch (@typeInfo(optional.child)) {
                 .bool => .truthy,
                 .float => .number,
+                .@"enum" => .option,
                 else => unreachable,
             },
             .@"enum" => .option,
@@ -1616,7 +1635,7 @@ test "the registry's takes-children predicate matches the interpreter's takes-ch
 ///   lowered through `Ui.inputGroup`), so no plain element maps to the
 ///   kind here — like chart, the bespoke builder is the channel.
 const markup_excluded_widget_kinds = [_]canvas.WidgetKind{
-    .icon_button, .data_grid, .popover, .menu_surface, .chart, .split_divider, .input_group,
+    .icon_button, .chart, .split_divider, .input_group,
 };
 
 pub const SegmentedModel = struct {

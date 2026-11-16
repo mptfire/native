@@ -31,6 +31,7 @@ const builtin = @import("builtin");
 const canvas = @import("root.zig");
 const markup = @import("ui_markup.zig");
 const interpreter = @import("ui_markup_view.zig");
+const reflect = @import("ui_markup_reflect.zig");
 
 const Value = interpreter.Value;
 
@@ -145,8 +146,10 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
             /// True when a value arg came from a declaration default rather
             /// than an explicit use-site argument.
             defaulted: bool = false,
-            const Kind = enum { item, value_arg, slice_arg, slot };
+            const Kind = enum { item, value_arg, slice_arg, slot, virtual };
         };
+
+        const VirtualBinding = struct { options: Ui.VirtualListOptions, range: canvas.VirtualListRange, consumed: *bool };
 
         fn EntryPayload(comptime entry: ScopeEntry) type {
             return switch (entry.kind) {
@@ -154,6 +157,7 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
                 .value_arg => Value,
                 .slice_arg => []const entry.Item,
                 .slot => entry.SiteScope,
+                .virtual => VirtualBinding,
             };
         }
 
@@ -278,6 +282,8 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
         }
 
         fn buildElementInner(comptime node: markup.MarkupNode, comptime entries: []const ScopeEntry, ui: *Ui, model: *const ModelT, scope: anytype, forwarded_press: ?MsgT) Ui.Node {
+            if (comptime std.mem.eql(u8, node.name, "virtual-window")) return buildVirtualWindow(node, entries, ui, model, scope);
+            if (comptime std.mem.eql(u8, node.name, "virtual-list")) return buildVirtualList(node, entries, ui, model, scope);
             if (comptime std.mem.eql(u8, node.name, "markdown")) {
                 return buildMarkdown(node, entries, ui, model, scope);
             }
@@ -505,7 +511,7 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
                         return built;
                     },
                     .app => |spelled| options.icon = spelled,
-                    .binding => options.icon = stringAttr(node, entries, comptime node.attr("name").?, ui, model, scope, markup.icon_name_message),
+                    .binding => options.icon = stringAttr(node, entries, "name", comptime node.attr("name").?, ui, model, scope, markup.icon_name_message),
                     .invalid => unreachable,
                 }
                 return ui.el(kind, options, .{});
@@ -623,6 +629,128 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
                 }
                 return steps;
             }
+        }
+
+        fn virtualCountAttr(comptime node: markup.MarkupNode, comptime entries: []const ScopeEntry, comptime name: []const u8, comptime fallback: usize, ui: *Ui, model: *const ModelT, scope: anytype) usize {
+            if (comptime node.attr(name) == null) return fallback;
+            const raw = comptime node.attr(name).?;
+            comptime requireVariant(exprVariant(node, entries, raw), &.{.integer}, node, "virtual window count requires an integer");
+            const value = evalExpr(node, entries, raw, ui, model, scope);
+            if (value == .integer and value.integer >= 0 and value.integer <= 9007199254740991) return @intCast(value.integer);
+            return runtimeFail(usize, ui);
+        }
+
+        fn virtualExtentAttr(comptime node: markup.MarkupNode, comptime entries: []const ScopeEntry, comptime name: []const u8, ui: *Ui, model: *const ModelT, scope: anytype) f32 {
+            if (comptime node.attr(name) == null) return 0;
+            const value = floatAttr(node, entries, node.attr(name).?, ui, model, scope);
+            if (!std.math.isFinite(value) or value < 0) return runtimeFail(f32, ui);
+            return value;
+        }
+
+        fn buildVirtualWindow(comptime node: markup.MarkupNode, comptime entries: []const ScopeEntry, ui: *Ui, model: *const ModelT, scope: anytype) Ui.Node {
+            comptime {
+                for (entries) |entry| if (entry.kind == .virtual) fail(node, "virtual-window declarations cannot nest");
+                if (node.children.len != 1 or (node.children[0].kind != .element and node.children[0].kind != .use_block)) fail(node, "virtual-window requires one root child");
+                for (node.attrs) |attribute| if (!markup.nameInList(attribute.name, &markup.virtual_window_attrs)) fail(node, "unsupported virtual-window attribute");
+            }
+            const identity = comptime node.attr("id") orelse fail(node, "virtual-window requires id");
+            const name = comptime node.attr("as") orelse fail(node, "virtual-window requires as");
+            const id = canvas.globalWidgetId(.scroll_view, .{ .str = identity });
+            if (ui.virtualWindows().len >= canvas.max_virtual_windows) return runtimeFail(Ui.Node, ui);
+            for (ui.virtualWindows()) |prior| if (prior.id == id) return runtimeFail(Ui.Node, ui);
+            var options = Ui.VirtualListOptions{
+                .id = identity,
+                .item_count = virtualCountAttr(node, entries, "item-count", 0, ui, model, scope),
+                .item_extent = virtualExtentAttr(node, entries, "item-extent", ui, model, scope),
+                .gap = virtualExtentAttr(node, entries, "gap", ui, model, scope),
+                .overscan = virtualCountAttr(node, entries, "overscan", 4, ui, model, scope),
+                .viewport_fallback = virtualExtentAttr(node, entries, "viewport-fallback", ui, model, scope),
+                .index_base = virtualCountAttr(node, entries, "index-base", 0, ui, model, scope),
+                .anchor = if (comptime std.mem.eql(u8, node.attr("anchor") orelse "leading", "trailing")) .trailing else .leading,
+            };
+            if (options.index_base > 9007199254740991 - options.item_count) return runtimeFail(Ui.Node, ui);
+            if (comptime node.attr("extent-estimate") != null) {
+                const estimate = comptime node.attr("extent-estimate").?;
+                if (comptime @hasDecl(ModelT, "virtualExtentHelper") and @hasDecl(ModelT, "virtualExtentEstimate")) {
+                    const helper = comptime ModelT.virtualExtentHelper(estimate) orelse fail(node, "extent-estimate requires a numeric index helper");
+                    options.extent_estimate = ModelT.virtualExtentEstimate;
+                    options.extent_context = @ptrFromInt(@as(usize, helper) + 1);
+                } else comptime fail(node, "extent-estimate requires a stable compiled helper capability");
+            }
+            if (options.extent_estimate == null and options.item_extent == 0) return runtimeFail(Ui.Node, ui);
+            const consumed = ui.arena.create(bool) catch return runtimeFail(Ui.Node, ui);
+            consumed.* = false;
+            const binding = VirtualBinding{ .options = options, .range = ui.virtualWindow(options), .consumed = consumed };
+            const inner = comptime entries ++ &[_]ScopeEntry{.{ .name = name, .kind = .virtual, .Item = canvas.VirtualListRange }};
+            const result = if (comptime node.children[0].kind == .use_block) buildUse(node.children[0], inner, ui, model, .{ .parent = scope, .item = binding }) else buildElement(node.children[0], inner, ui, model, .{ .parent = scope, .item = binding });
+            if (!consumed.*) return runtimeFail(Ui.Node, ui);
+            return result;
+        }
+
+        fn buildVirtualList(comptime node: markup.MarkupNode, comptime entries: []const ScopeEntry, ui: *Ui, model: *const ModelT, scope: anytype) Ui.Node {
+            const index = comptime scopeIndex(entries, node.attr("window") orelse fail(node, "virtual-list requires window")) orelse fail(node, "virtual-list requires an enclosing window");
+            comptime {
+                if (entries[index].kind != .virtual) fail(node, "virtual-list requires an enclosing window");
+                if (node.children.len != 1 or (node.children[0].kind != .element and node.children[0].kind != .use_block)) fail(node, "virtual-list requires one keyed root per row");
+            }
+            const name = comptime node.attr("as") orelse fail(node, "virtual-list requires as");
+            const each = comptime node.attr("each") orelse fail(node, "virtual-list requires each");
+            const query = comptime blk: {
+                if (!@hasDecl(ModelT, each)) fail(node, "virtual-list each requires a complete range query");
+                const Decl = @TypeOf(@field(ModelT, each));
+                if (!reflect.isVirtualItemFn(ModelT, Decl)) fail(node, "virtual-list each requires a complete range query");
+                break :blk @typeInfo(Decl).@"fn";
+            };
+            const Parameter = query.params[1].type.?;
+            const Range = reflect.Pointee(Parameter);
+            const Item = reflect.sliceElement(query.return_type.?).?;
+            const resolved = scopePayload(entries, index, scope);
+            if (resolved.consumed.*) return runtimeFail(Ui.Node, ui);
+            resolved.consumed.* = true;
+            var range: Range = undefined;
+            inline for (@typeInfo(Range).@"struct".fields) |field| {
+                const source = @field(resolved.range, field.name);
+                @field(range, field.name) = switch (@typeInfo(field.type)) {
+                    .int => @intCast(source),
+                    .float => if (@typeInfo(@TypeOf(source)) == .int) @floatFromInt(source) else @floatCast(source),
+                    else => unreachable,
+                };
+            }
+            const argument = if (Parameter == Range) range else &range;
+            const items = if (comptime query.params.len == 3) @field(ModelT, each)(model, argument, ui.arena) else @field(ModelT, each)(model, argument);
+            if (items.len != resolved.range.itemCount()) return runtimeFail(Ui.Node, ui);
+            var rows: std.ArrayListUnmanaged(Ui.Node) = .empty;
+            const inner = comptime entries ++ &[_]ScopeEntry{.{ .name = name, .kind = .item, .Item = Item }};
+            for (items) |*item| {
+                const row = if (comptime node.children[0].kind == .use_block) buildUse(node.children[0], inner, ui, model, .{ .parent = scope, .item = item }) else buildElement(node.children[0], inner, ui, model, .{ .parent = scope, .item = item });
+                if (row.key == null and row.global_key == null) return runtimeFail(Ui.Node, ui);
+                rows.append(ui.arena, row) catch return runtimeFail(Ui.Node, ui);
+            }
+            const proxy = comptime blk: {
+                var copy = node;
+                copy.name = "scroll";
+                var attributes: []const markup.MarkupAttr = &.{};
+                for (node.attrs) |attribute| {
+                    if (!std.mem.eql(u8, attribute.name, "window") and !std.mem.eql(u8, attribute.name, "each") and !std.mem.eql(u8, attribute.name, "as")) attributes = attributes ++ &[_]markup.MarkupAttr{attribute};
+                }
+                copy.attrs = attributes;
+                break :blk copy;
+            };
+            var element: Ui.ElementOptions = .{};
+            applyAttrs(proxy, entries, ui, model, scope, &element);
+            var options = resolved.options;
+            options.width = element.width;
+            options.height = element.height;
+            options.min_width = element.min_width;
+            options.grow = element.grow;
+            options.padding = element.padding orelse 0;
+            options.style_tokens = element.style_tokens;
+            options.semantics = element.semantics;
+            options.overscroll = element.overscroll;
+            options.on_scroll = element.on_scroll;
+            options.on_reach_end = element.on_reach_end;
+            options.on_reach_start = element.on_reach_start;
+            return ui.virtualList(options, resolved.range, .{rows.items});
         }
 
         fn buildChildren(comptime node: markup.MarkupNode, comptime entries: []const ScopeEntry, ui: *Ui, model: *const ModelT, scope: anytype, out: *std.ArrayListUnmanaged(Ui.Node)) void {
@@ -804,8 +932,8 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
                     const expression = markup.parseAttrExpression(raw) orelse fail(node, markup.markdown_issue_link_base_message);
                     if (expression == .equals) fail(node, markup.markdown_issue_link_base_message);
                 }
-                comptime requireVariant(exprVariant(node, entries, raw), &.{.string}, node, markup.markdown_issue_link_base_message);
-                const base = switch (evalExpr(node, entries, raw, ui, model, scope)) {
+                comptime requireVariant(attrExprVariant(node, entries, "issue-link-base", raw), &.{.string}, node, markup.markdown_issue_link_base_message);
+                const base = switch (attrExprValue(node, entries, "issue-link-base", raw, ui, model, scope)) {
                     .string => |text| text,
                     else => runtimeFail([]const u8, ui),
                 };
@@ -905,7 +1033,7 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
                 options.grow = floatAttr(node, entries, comptime node.attr("grow").?, ui, model, scope);
             }
             if (comptime (node.attr("label") != null)) {
-                options.semantics.label = stringAttr(node, entries, comptime node.attr("label").?, ui, model, scope, "label expects text");
+                options.semantics.label = stringAttr(node, entries, "label", comptime node.attr("label").?, ui, model, scope, "label expects text");
             }
             if (comptime (node.attr("key") != null)) {
                 options.key = attrKey(node, entries, comptime node.attr("key").?, ui, model, scope, "keys must be integers or strings");
@@ -946,7 +1074,7 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
                 const expression = markup.parseMessageExpression(raw) orelse fail(node, markup.markdown_on_details_message);
                 if (expression.payload.len != 0) fail(node, markup.markdown_on_details_message);
                 for (@typeInfo(MsgT).@"union".fields) |field| {
-                    if (field.type == usize and std.mem.eql(u8, field.name, expression.tag)) {
+                    if ((field.type == usize or field.type == i64) and std.mem.eql(u8, field.name, expression.tag)) {
                         return Md.detailsMsg(@field(std.meta.Tag(MsgT), field.name));
                     }
                 }
@@ -992,17 +1120,23 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
             if (comptime (scope_index_opt != null)) {
                 const scope_index = comptime scope_index_opt.?;
                 comptime {
-                    if (entries[scope_index].kind != .slice_arg or entries[scope_index].Item != canvas.markdown.ResolvedImage) {
+                    if (entries[scope_index].kind != .slice_arg or !reflect.isMarkdownImageItem(entries[scope_index].Item)) {
                         fail(node, markup.markdown_images_message);
                     }
                 }
-                return scopePayload(entries, scope_index, scope);
+                return @import("markdown_image_binding.zig").convert(ui.arena, scopePayload(entries, scope_index, scope)) catch {
+                    ui.failed = true;
+                    return &.{};
+                };
             }
             const info = comptime (eachInfo(path) orelse fail(node, markup.markdown_images_message));
             comptime {
-                if (info.Item != canvas.markdown.ResolvedImage) fail(node, markup.markdown_images_message);
+                if (!reflect.isMarkdownImageItem(info.Item)) fail(node, markup.markdown_images_message);
             }
-            return eachItems(info, ui, model);
+            return @import("markdown_image_binding.zig").convert(ui.arena, eachItems(info, ui, model)) catch {
+                ui.failed = true;
+                return &.{};
+            };
         }
 
         // ------------------------------------------------ stepper/timeline
@@ -1049,7 +1183,7 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
                 options.global_key = attrKey(node, entries, comptime node.attr("global-key").?, ui, model, scope, "keys must be integers or strings");
             }
             if (comptime (node.attr("label") != null)) {
-                options.semantics.label = stringAttr(node, entries, comptime node.attr("label").?, ui, model, scope, "label expects text");
+                options.semantics.label = stringAttr(node, entries, "label", comptime node.attr("label").?, ui, model, scope, "label expects text");
             }
             const slot_index: ?usize = comptime if (node.children.len == 1 and node.children[0].kind == .slot_block) innermostSlotIndex(entries) else null;
             if (comptime (node.children.len == 1 and node.children[0].kind == .slot_block and slot_index == null)) {
@@ -1121,7 +1255,7 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
             }
             var options: Ui.InputGroupOptions = .{};
             if (comptime (node.attr("label") != null)) {
-                options.semantics.label = stringAttr(node, entries, comptime node.attr("label").?, ui, model, scope, "label expects text");
+                options.semantics.label = stringAttr(node, entries, "label", comptime node.attr("label").?, ui, model, scope, "label expects text");
             }
             if (comptime (node.attr("width") != null)) {
                 options.width = floatAttr(node, entries, comptime node.attr("width").?, ui, model, scope);
@@ -1205,7 +1339,7 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
                 options.global_key = attrKey(node, entries, comptime node.attr("global-key").?, ui, model, scope, "keys must be integers or strings");
             }
             if (comptime (node.attr("label") != null)) {
-                options.semantics.label = stringAttr(node, entries, comptime node.attr("label").?, ui, model, scope, "label expects text");
+                options.semantics.label = stringAttr(node, entries, "label", comptime node.attr("label").?, ui, model, scope, "label expects text");
             }
             var children: std.ArrayListUnmanaged(Ui.Node) = .empty;
             buildChildren(node, entries, ui, model, scope, &children);
@@ -1235,22 +1369,22 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
                 }
             }
             var options: Ui.TimelineItemOptions = .{ .title = "" };
-            options.title = stringAttr(node, entries, comptime node.attr("title").?, ui, model, scope, markup.timeline_item_text_attr_message);
+            options.title = stringAttr(node, entries, "title", comptime node.attr("title").?, ui, model, scope, markup.timeline_item_text_attr_message);
             if (comptime (node.attr("description") != null)) {
-                options.description = stringAttr(node, entries, comptime node.attr("description").?, ui, model, scope, markup.timeline_item_text_attr_message);
+                options.description = stringAttr(node, entries, "description", comptime node.attr("description").?, ui, model, scope, markup.timeline_item_text_attr_message);
             }
             if (comptime (node.attr("meta") != null)) {
-                options.meta = stringAttr(node, entries, comptime node.attr("meta").?, ui, model, scope, markup.timeline_item_text_attr_message);
+                options.meta = stringAttr(node, entries, "meta", comptime node.attr("meta").?, ui, model, scope, markup.timeline_item_text_attr_message);
             }
             if (comptime (node.attr("indicator") != null)) {
-                options.indicator = stringAttr(node, entries, comptime node.attr("indicator").?, ui, model, scope, markup.timeline_item_text_attr_message);
+                options.indicator = stringAttr(node, entries, "indicator", comptime node.attr("indicator").?, ui, model, scope, markup.timeline_item_text_attr_message);
             }
             if (comptime (node.attr("icon") != null)) {
                 // Vector icon indicator: the shared icon value grammar,
                 // resolved at comptime like every icon attribute.
                 switch (comptime iconValueChecked(node, node.attr("icon").?, markup.button_icon_message)) {
                     .builtin, .app => |name| options.icon = name,
-                    .binding => options.icon = stringAttr(node, entries, comptime node.attr("icon").?, ui, model, scope, markup.button_icon_message),
+                    .binding => options.icon = stringAttr(node, entries, "icon", comptime node.attr("icon").?, ui, model, scope, markup.button_icon_message),
                     .invalid => unreachable,
                 }
             }
@@ -1384,7 +1518,7 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
                 options.global_key = attrKey(node, entries, comptime node.attr("global-key").?, ui, model, scope, "keys must be integers or strings");
             }
             if (comptime (node.attr("label") != null)) {
-                options.semantics.label = stringAttr(node, entries, comptime node.attr("label").?, ui, model, scope, "label expects text");
+                options.semantics.label = stringAttr(node, entries, "label", comptime node.attr("label").?, ui, model, scope, "label expects text");
             }
             const series = ui.arena.alloc(canvas.ChartSeries, node.children.len) catch {
                 ui.failed = true;
@@ -1440,7 +1574,7 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
                 };
             }
             if (comptime (node.attr("label") != null)) {
-                series.label = stringAttr(node, entries, comptime node.attr("label").?, ui, model, scope, markup.series_label_message);
+                series.label = stringAttr(node, entries, "label", comptime node.attr("label").?, ui, model, scope, markup.series_label_message);
             }
             return series;
         }
@@ -1469,7 +1603,7 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
             }
             var options: Ui.VideoOptions = .{};
             if (comptime (node.attr("src") != null)) {
-                options.src = stringAttr(node, entries, comptime node.attr("src").?, ui, model, scope, markup.video_src_message);
+                options.src = stringAttr(node, entries, "src", comptime node.attr("src").?, ui, model, scope, markup.video_src_message);
             }
             if (comptime (node.attr("controls") != null)) {
                 options.controls = videoFlagValue(node, entries, comptime node.attr("controls").?, ui, model, scope);
@@ -1493,7 +1627,7 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
                 options.grow = floatAttr(node, entries, comptime node.attr("grow").?, ui, model, scope);
             }
             if (comptime (node.attr("label") != null)) {
-                options.label = stringAttr(node, entries, comptime node.attr("label").?, ui, model, scope, "label expects text");
+                options.label = stringAttr(node, entries, "label", comptime node.attr("label").?, ui, model, scope, "label expects text");
             }
             if (comptime (node.attr("key") != null)) {
                 options.key = attrKey(node, entries, comptime node.attr("key").?, ui, model, scope, "keys must be integers or strings");
@@ -1594,9 +1728,9 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
             }
         }
 
-        fn stringAttr(comptime node: markup.MarkupNode, comptime entries: []const ScopeEntry, comptime raw: []const u8, ui: *Ui, model: *const ModelT, scope: anytype, comptime message: []const u8) []const u8 {
-            comptime requireVariant(exprVariant(node, entries, raw), &.{.string}, node, message);
-            return switch (evalExpr(node, entries, raw, ui, model, scope)) {
+        fn stringAttr(comptime node: markup.MarkupNode, comptime entries: []const ScopeEntry, comptime attribute_name: []const u8, comptime raw: []const u8, ui: *Ui, model: *const ModelT, scope: anytype, comptime message: []const u8) []const u8 {
+            comptime requireVariant(attrExprVariant(node, entries, attribute_name, raw), &.{.string}, node, message);
+            return switch (attrExprValue(node, entries, attribute_name, raw, ui, model, scope)) {
                 .string => |text| text,
                 else => runtimeFail([]const u8, ui),
             };
@@ -1631,7 +1765,7 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
             /// parsed as an expression.
             defaulted: bool = false,
 
-            const Kind = enum { value, slice };
+            const Kind = enum { value, slice, virtual };
         };
 
         /// Expand a `<use>` site: resolve the template, check its declared
@@ -1739,6 +1873,9 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
                     const path = expression.binding;
                     const head = interpreter.pathHead(path);
                     if (scopeIndex(site_entries, head)) |index| {
+                        if (site_entries[index].kind == .virtual and interpreter.pathTail(path) == null) {
+                            return .{ .name = arg_name, .raw = raw, .kind = .virtual, .site_index = index };
+                        }
                         if (site_entries[index].kind == .slice_arg and interpreter.pathTail(path) == null) {
                             return .{ .name = arg_name, .raw = raw, .kind = .slice, .Item = site_entries[index].Item, .site_index = index };
                         }
@@ -1762,6 +1899,7 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
                     entries = entries ++ &[_]ScopeEntry{switch (spec.kind) {
                         .value => .{ .name = spec.name, .kind = .value_arg, .variant = spec.variant, .defaulted = spec.defaulted },
                         .slice => .{ .name = spec.name, .kind = .slice_arg, .Item = spec.Item },
+                        .virtual => .{ .name = spec.name, .kind = .virtual, .Item = canvas.VirtualListRange },
                     }};
                 }
                 return entries;
@@ -1772,6 +1910,7 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
             return switch (spec.kind) {
                 .value => Value,
                 .slice => []const spec.Item,
+                .virtual => VirtualBinding,
             };
         }
 
@@ -1795,7 +1934,7 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
         }
 
         fn argPayloadValue(comptime spec: ArgSpec, comptime site_entries: []const ScopeEntry, comptime node: markup.MarkupNode, ui: *Ui, model: *const ModelT, site_scope: anytype) ArgPayload(spec) {
-            if (comptime (spec.kind == .slice)) {
+            if (comptime (spec.kind == .slice or spec.kind == .virtual)) {
                 if (comptime (spec.site_index != null)) {
                     return scopePayload(site_entries, comptime spec.site_index.?, site_scope);
                 }
@@ -1884,11 +2023,17 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
                     options.key = attrKey(node, entries, attribute.value, ui, model, scope, "keys must be integers or strings");
                 } else if (comptime std.mem.eql(u8, attribute.name, "global-key")) {
                     options.global_key = attrKey(node, entries, attribute.value, ui, model, scope, "keys must be integers or strings");
+                } else if (comptime std.mem.eql(u8, attribute.name, "focusable")) {
+                    comptime requireVariant(attrExprVariant(node, entries, attribute.name, attribute.value), &.{.boolean}, node, "focusable expects a boolean");
+                    options.semantics.focusable = switch (attrExprValue(node, entries, attribute.name, attribute.value, ui, model, scope)) {
+                        .boolean => |flag| flag,
+                        else => runtimeFail(bool, ui),
+                    };
                 } else if (comptime std.mem.eql(u8, attribute.name, "role")) {
                     options.semantics.role = roleValue(node, entries, attribute.value, ui, model, scope);
                 } else if (comptime std.mem.eql(u8, attribute.name, "label")) {
-                    comptime requireVariant(exprVariant(node, entries, attribute.value), &.{.string}, node, "label expects text");
-                    options.semantics.label = switch (evalExpr(node, entries, attribute.value, ui, model, scope)) {
+                    comptime requireVariant(attrExprVariant(node, entries, attribute.name, attribute.value), &.{.string}, node, "label expects text");
+                    options.semantics.label = switch (attrExprValue(node, entries, attribute.name, attribute.value, ui, model, scope)) {
                         .string => |text| text,
                         else => runtimeFail([]const u8, ui),
                     };
@@ -1929,7 +2074,7 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
                     comptime if (!markup.iconAttrElement(node.name)) fail(node, markup.button_icon_element_message);
                     switch (comptime iconValueChecked(node, attribute.value, markup.button_icon_message)) {
                         .builtin, .app => |name| options.icon = name,
-                        .binding => options.icon = stringAttr(node, entries, attribute.value, ui, model, scope, markup.button_icon_message),
+                        .binding => options.icon = stringAttr(node, entries, attribute.name, attribute.value, ui, model, scope, markup.button_icon_message),
                         .invalid => unreachable,
                     }
                 } else if (comptime std.mem.eql(u8, attribute.name, "anchor")) {
@@ -1972,7 +2117,7 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
                 } else if (comptime std.mem.eql(u8, attribute.name, "radius")) {
                     options.style_tokens.radius = comptime radiusTokenRef(node, attribute.value);
                 } else {
-                    setOption(node, comptime optionFieldName(node, attribute.name), attribute.value, entries, ui, model, scope, options);
+                    setOption(node, comptime optionFieldName(node, attribute.name), attribute.name, attribute.value, entries, ui, model, scope, options);
                 }
             }
         }
@@ -2065,14 +2210,15 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
                 if (expression != .binding) fail(node, markup.terminal_pty_message);
             }
             const path = comptime markup.parseAttrExpression(raw).?.binding;
-            comptime requireVariant(pathVariant(node, entries, path, true), &.{.integer}, node, markup.terminal_pty_message);
+            comptime requireVariant(pathVariant(node, entries, path, true), &.{ .integer, .string }, node, markup.terminal_pty_message);
             // Range-checked before the u64 cast (the interpreter fails
             // the same way): a signed model field can deliver a negative
             // — fail the build, never trap.
-            options.pty = switch (bindingValue(node, entries, path, ui, model, scope, true)) {
-                .integer => |int| if (int < 0) runtimeFail(u64, ui) else @intCast(int),
-                else => runtimeFail(u64, ui),
-            };
+            switch (bindingValue(node, entries, path, ui, model, scope, true)) {
+                .integer => |int| options.pty = if (int < 0) runtimeFail(u64, ui) else @intCast(int),
+                .string => |name| options.pty_name = name,
+                else => options.pty = runtimeFail(u64, ui),
+            }
         }
 
         fn colorStyleField(comptime attr_name: []const u8) ?[]const u8 {
@@ -2117,24 +2263,37 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
             }
         }
 
-        fn setOption(comptime node: markup.MarkupNode, comptime zig_field: []const u8, comptime raw: []const u8, comptime entries: []const ScopeEntry, ui: *Ui, model: *const ModelT, scope: anytype, options: *Ui.ElementOptions) void {
+        fn setOption(comptime node: markup.MarkupNode, comptime zig_field: []const u8, comptime attribute_name: []const u8, comptime raw: []const u8, comptime entries: []const ScopeEntry, ui: *Ui, model: *const ModelT, scope: anytype, options: *Ui.ElementOptions) void {
             const FieldType = @FieldType(Ui.ElementOptions, zig_field);
-            const variant = comptime exprVariant(node, entries, raw);
+            const variant = comptime attrExprVariant(node, entries, attribute_name, raw);
             switch (comptime @typeInfo(FieldType)) {
                 .float => {
                     comptime requireVariant(variant, &.{ .float, .integer }, node, "expected a number");
-                    @field(options, zig_field) = switch (evalExpr(node, entries, raw, ui, model, scope)) {
+                    @field(options, zig_field) = switch (attrExprValue(node, entries, attribute_name, raw, ui, model, scope)) {
                         .float => |float| float,
                         .integer => |int| @floatFromInt(int),
                         else => runtimeFail(FieldType, ui),
                     };
                 },
-                .bool => @field(options, zig_field) = evalExpr(node, entries, raw, ui, model, scope).truthy(),
+                .bool => @field(options, zig_field) = attrExprValue(node, entries, attribute_name, raw, ui, model, scope).truthy(),
                 .optional => |optional| switch (@typeInfo(optional.child)) {
-                    .bool => @field(options, zig_field) = evalExpr(node, entries, raw, ui, model, scope).truthy(),
+                    .bool => @field(options, zig_field) = attrExprValue(node, entries, attribute_name, raw, ui, model, scope).truthy(),
+                    .@"enum" => {
+                        comptime requireVariant(variant, &.{.string}, node, "expected an option name");
+                        const expression = comptime markup.parseAttrExpression(raw).?;
+                        if (comptime expression == .literal) {
+                            @field(options, zig_field) = comptime (std.meta.stringToEnum(optional.child, expression.literal) orelse fail(node, "unknown option value"));
+                        } else {
+                            const text = switch (attrExprValue(node, entries, attribute_name, raw, ui, model, scope)) {
+                                .string => |text| text,
+                                else => runtimeFail([]const u8, ui),
+                            };
+                            @field(options, zig_field) = std.meta.stringToEnum(optional.child, text) orelse runtimeFail(optional.child, ui);
+                        }
+                    },
                     .float => {
                         comptime requireVariant(variant, &.{ .float, .integer }, node, "expected a number");
-                        @field(options, zig_field) = switch (evalExpr(node, entries, raw, ui, model, scope)) {
+                        @field(options, zig_field) = switch (attrExprValue(node, entries, attribute_name, raw, ui, model, scope)) {
                             .float => |float| float,
                             .integer => |int| @floatFromInt(int),
                             else => runtimeFail(optional.child, ui),
@@ -2152,7 +2311,7 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
                     // @intCast TRAPPED on it instead of failing the
                     // build. The field type is the honest upper bound;
                     // no semantic cap is invented on top of it.
-                    @field(options, zig_field) = switch (evalExpr(node, entries, raw, ui, model, scope)) {
+                    @field(options, zig_field) = switch (attrExprValue(node, entries, attribute_name, raw, ui, model, scope)) {
                         .integer => |int| if (int < 0 or int > std.math.maxInt(FieldType)) runtimeFail(FieldType, ui) else @intCast(int),
                         else => runtimeFail(FieldType, ui),
                     };
@@ -2165,7 +2324,7 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
                         // is a compile error, not a failed rebuild.
                         @field(options, zig_field) = comptime (std.meta.stringToEnum(FieldType, expression.literal) orelse fail(node, "unknown option value"));
                     } else {
-                        const text = switch (evalExpr(node, entries, raw, ui, model, scope)) {
+                        const text = switch (attrExprValue(node, entries, attribute_name, raw, ui, model, scope)) {
                             .string => |text| text,
                             else => runtimeFail([]const u8, ui),
                         };
@@ -2174,7 +2333,7 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
                 },
                 .pointer => {
                     comptime requireVariant(variant, &.{.string}, node, "expected text");
-                    @field(options, zig_field) = switch (evalExpr(node, entries, raw, ui, model, scope)) {
+                    @field(options, zig_field) = switch (attrExprValue(node, entries, attribute_name, raw, ui, model, scope)) {
                         .string => |text| text,
                         else => runtimeFail(FieldType, ui),
                     };
@@ -2314,6 +2473,8 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
                 options.on_hover_enter = msg;
             } else if (comptime std.mem.eql(u8, event, "hover-leave")) {
                 options.on_hover_leave = msg;
+            } else if (comptime std.mem.eql(u8, event, "reach-start") and std.mem.eql(u8, node.name, "scroll")) {
+                options.on_reach_start = msg;
             } else if (comptime std.mem.eql(u8, event, "reach-end")) {
                 // The approach-end signal (infinite-scroll fetch) is
                 // emitted for scroll containers only (interpreter and
@@ -2527,6 +2688,14 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
 
         const invalid_expression_message = markup.invalid_expression_message;
 
+        fn attrExprValue(comptime node: markup.MarkupNode, comptime entries: []const ScopeEntry, comptime attribute_name: []const u8, comptime raw: []const u8, ui: *Ui, model: *const ModelT, scope: anytype) Value {
+            const expression = comptime (markup.parseAttrExpression(raw) orelse fail(node, invalid_expression_message));
+            if (comptime (expression == .literal)) {
+                return comptime interpreter.literalValueForAttribute(expression.literal, attribute_name);
+            }
+            return evalExpr(node, entries, raw, ui, model, scope);
+        }
+
         fn evalExpr(comptime node: markup.MarkupNode, comptime entries: []const ScopeEntry, comptime raw: []const u8, ui: *Ui, model: *const ModelT, scope: anytype) Value {
             const expression = comptime (markup.parseAttrExpression(raw) orelse fail(node, invalid_expression_message));
             if (comptime (expression == .literal)) {
@@ -2654,6 +2823,21 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
             }
         }
 
+        fn attrExprVariant(comptime node: markup.MarkupNode, comptime entries: []const ScopeEntry, comptime attribute_name: []const u8, comptime raw: []const u8) ?ValueVariant {
+            comptime {
+                const expression = markup.parseAttrExpression(raw) orelse fail(node, invalid_expression_message);
+                if (expression == .literal) {
+                    return switch (interpreter.literalValueForAttribute(expression.literal, attribute_name)) {
+                        .string => .string,
+                        .integer => .integer,
+                        .float => .float,
+                        .boolean => .boolean,
+                    };
+                }
+                return exprVariant(node, entries, raw);
+            }
+        }
+
         /// Innermost scope entry whose name matches `head`.
         fn scopeIndex(comptime entries: []const ScopeEntry, comptime head: []const u8) ?usize {
             comptime {
@@ -2742,6 +2926,10 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
                 }
                 const Leaf = comptime BindingLeaf(node, entries, path, allow_arena);
                 const item = scopePayload(entries, index, scope);
+                if (comptime entry.kind == .virtual) {
+                    const tail = comptime interpreter.pathTail(path).?;
+                    return interpreter.valueOf(Leaf, valueOn(canvas.VirtualListRange, tail, &item.range, ui.arena)) orelse unreachable;
+                }
                 if (comptime (interpreter.pathTail(path) != null)) {
                     const tail = comptime interpreter.pathTail(path).?;
                     return interpreter.valueOf(Leaf, valueOn(entry.Item, tail, item, ui.arena)) orelse unreachable;
@@ -3071,6 +3259,7 @@ fn CompiledMarkupEngine(comptime ModelT: type, comptime MsgT: type, comptime res
                 .bool => false,
                 .@"enum" => |info| @field(T, info.fields[0].name),
                 .pointer => "",
+                .@"struct" => if (T == Ui.Node) .{} else comptime @compileError("no placeholder for " ++ @typeName(T)),
                 else => comptime @compileError("no placeholder for " ++ @typeName(T)),
             };
         }

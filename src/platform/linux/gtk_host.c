@@ -1,4 +1,5 @@
 #include "gtk_host.h"
+#include "gtk_pixels.h"
 
 #include <gtk/gtk.h>
 #include <glib/gstdio.h>
@@ -235,6 +236,45 @@ typedef struct native_sdk_gtk_native_view {
     int gpu_pointer_down;
     double gpu_pointer_x;
     double gpu_pointer_y;
+    /* BEGIN scroll-coalesce patch (zig-nostr/native) */
+    /* Scroll deltas waiting for their frame, and the ONE GLib source that
+     * will carry them out. Same shape as gpu_emit_source above and for the
+     * same reason: a producer that arrives while one is queued folds into
+     * it rather than arming a second.
+     *
+     * A scroll source is CONTINUOUS. A high-resolution wheel or a touchpad
+     * delivers 100-200 events a second, and every one of them used to be
+     * emitted on the spot, which meant a full engine dispatch (view rebuild,
+     * layout, display-list diff) inside the GTK signal handler. That work
+     * outlasts the gap to the next event, so GDK's input source at
+     * G_PRIORITY_DEFAULT was ready again the moment it returned and the main
+     * loop never descended to the idle band where the frame emission above
+     * lives. Measured on a real gesture: 138 input events a second, 2.4
+     * seconds between presented frames, timers still firing on time, and
+     * under half a core in use. The window was not too busy to draw, it was
+     * never asked. Coalescing is what makes the input source go quiet
+     * between events, which is what lets the idle band run at all. */
+    guint gpu_scroll_source;
+    uint64_t gpu_scroll_last_emit_ns;
+    double gpu_scroll_dx;
+    double gpu_scroll_dy;
+    /* The pointer where the gesture IS, captured with the delta rather
+     * than read at flush time. Pointer motion still emits per event and
+     * rewrites gpu_pointer_x/y, so a wheel spin whose pointer crosses into
+     * another scroll region would otherwise hand that region the whole
+     * frame's accumulated delta. macOS snapshots the same way. */
+    double gpu_scroll_x;
+    double gpu_scroll_y;
+    /* Last writer for the frame. Nothing on the scroll path reads these
+     * today; a modifier changing mid-frame would be attributed to the
+     * whole of it, which is what to fix first if Ctrl+scroll ever means
+     * something here. */
+    uint32_t gpu_scroll_modifiers;
+    /* Events folded into the pending flush, and whether every one of them
+     * came from a detented device (the kind the flush emits). */
+    int gpu_scroll_events;
+    int gpu_scroll_all_detented;
+    /* END scroll-coalesce patch */
     GtkIMContext *gpu_im_context;
     char *gpu_preedit_text;
     /* Window-drag region mirror (see native_sdk_gtk_drag_region_t),
@@ -937,6 +977,7 @@ static GtkWidget *native_sdk_make_native_widget(int kind, const char *label, con
 #define NATIVE_SDK_GTK_GPU_INPUT_IME_COMMIT_COMPOSITION 9
 #define NATIVE_SDK_GTK_GPU_INPUT_IME_CANCEL_COMPOSITION 10
 #define NATIVE_SDK_GTK_GPU_INPUT_POINTER_CANCEL 11
+#define NATIVE_SDK_GTK_GPU_INPUT_DETENTED_SCROLL 15
 
 static uint64_t native_sdk_gpu_timestamp_ns(void) {
     return (uint64_t)g_get_monotonic_time() * 1000ull;
@@ -1494,22 +1535,115 @@ static void native_sdk_gpu_pointer_leave(GtkEventControllerMotion *controller, g
     native_sdk_emit_gpu_surface_input(view, NATIVE_SDK_GTK_GPU_INPUT_POINTER_CANCEL, view->gpu_pointer_x, view->gpu_pointer_y, 0, 0, 0, "", "", modifiers);
 }
 
+/* BEGIN scroll-coalesce patch (zig-nostr/native) */
+/* One scroll event per frame interval, carrying everything that arrived
+ * since the last one. The deltas SUM, so nothing a reader did is lost or
+ * rescaled: coalescing changes when the engine hears about the gesture,
+ * never how far it went.
+ *
+ * Armed at G_PRIORITY_DEFAULT, deliberately, unlike the frame emission.
+ * This IS input, it stands where the per-event emission stood, and it must
+ * not be parked in the same idle band it exists to unblock. It cannot spin:
+ * it arms only when a delta is waiting and disarms on the flush, so between
+ * gestures there is no source at all. The idle law the frame scheduler
+ * follows is untouched. */
+/* The pacing clock for scroll emissions, and the reason this is not a
+ * bare timestamp. Stamping `now` would mean that a dispatch overrunning
+ * the frame interval leaves now > last + interval, so the next scroll
+ * event arms at delay 0 and the flush is ready on every main-loop
+ * iteration. That is the very starvation this patch exists to remove,
+ * wearing the flush's clothes instead of GDK's. Re-anchoring to the most
+ * recent grid point keeps the next delay inside (0, interval] no matter
+ * how long a dispatch ran, so an overrun degrades the scroll rate
+ * gracefully instead of collapsing the idle band again.
+ *
+ * It is `native_sdk_gpu_surface_advance_pacing_clock` applied to the
+ * scroll clock, and it runs BEFORE the emission for the same reason that
+ * one does: the emission dispatches into the engine, which may tear this
+ * view down, so nothing may touch `view` once it returns. */
+static void native_sdk_gpu_scroll_advance_pacing_clock(native_sdk_gtk_native_view_t *view) {
+    const uint64_t now = native_sdk_gpu_timestamp_ns();
+    if (view->gpu_scroll_last_emit_ns == 0) {
+        view->gpu_scroll_last_emit_ns = now;
+        return;
+    }
+    const uint64_t scheduled_ns = view->gpu_scroll_last_emit_ns + NATIVE_SDK_GTK_GPU_FRAME_INTERVAL_NS;
+    if (now < scheduled_ns) {
+        view->gpu_scroll_last_emit_ns = now;
+    } else {
+        view->gpu_scroll_last_emit_ns = scheduled_ns + ((now - scheduled_ns) / NATIVE_SDK_GTK_GPU_FRAME_INTERVAL_NS) * NATIVE_SDK_GTK_GPU_FRAME_INTERVAL_NS;
+    }
+}
+
+static gboolean native_sdk_gpu_scroll_flush(gpointer data) {
+    native_sdk_gtk_native_view_t *view = data;
+    if (!view) return G_SOURCE_REMOVE;
+    view->gpu_scroll_source = 0;
+    const double delta_x = view->gpu_scroll_dx;
+    const double delta_y = view->gpu_scroll_dy;
+    view->gpu_scroll_dx = 0;
+    view->gpu_scroll_dy = 0;
+    const int input_kind = view->gpu_scroll_all_detented ? NATIVE_SDK_GTK_GPU_INPUT_DETENTED_SCROLL : NATIVE_SDK_GTK_GPU_INPUT_SCROLL;
+    view->gpu_scroll_events = 0;
+    if (!view->widget || !view->window || !view->window->host) return G_SOURCE_REMOVE;
+    if (delta_x == 0.0 && delta_y == 0.0) return G_SOURCE_REMOVE;
+    native_sdk_gpu_scroll_advance_pacing_clock(view);
+    native_sdk_emit_gpu_surface_input(view, input_kind, view->gpu_scroll_x, view->gpu_scroll_y, 0, delta_x, delta_y, "", "", view->gpu_scroll_modifiers);
+    return G_SOURCE_REMOVE;
+}
+
+/* The frame-interval grid anchored at the last emission, which is exactly
+ * what native_sdk_gpu_surface_schedule_frame_emission does for frames. The
+ * first event of a gesture finds no recent emission and goes out on the
+ * next loop iteration, so nothing is added to the latency a reader feels
+ * at the start of a scroll; only the flood behind it is thinned. */
+static void native_sdk_gpu_scroll_schedule_flush(native_sdk_gtk_native_view_t *view) {
+    if (!view || !view->widget || !view->window || !view->window->host) return;
+    if (view->gpu_scroll_source) return;
+    const uint64_t now = native_sdk_gpu_timestamp_ns();
+    uint64_t delay_ns = 0;
+    if (view->gpu_scroll_last_emit_ns > 0 && now < view->gpu_scroll_last_emit_ns + NATIVE_SDK_GTK_GPU_FRAME_INTERVAL_NS) {
+        delay_ns = view->gpu_scroll_last_emit_ns + NATIVE_SDK_GTK_GPU_FRAME_INTERVAL_NS - now;
+    }
+    view->gpu_scroll_source = g_timeout_add_full(G_PRIORITY_DEFAULT, (guint)((delay_ns + 500000ull) / 1000000ull), native_sdk_gpu_scroll_flush, view, NULL);
+}
+/* END scroll-coalesce patch */
+
 static gboolean native_sdk_gpu_scroll(GtkEventControllerScroll *controller, double dx, double dy, gpointer data) {
     native_sdk_gtk_native_view_t *view = data;
     if (!view) return FALSE;
     double delta_x = dx;
     double delta_y = dy;
+    int detented = 0;
 #if GTK_CHECK_VERSION(4, 8, 0)
     if (gtk_event_controller_scroll_get_unit(controller) == GDK_SCROLL_UNIT_WHEEL) {
         delta_x *= 40.0;
         delta_y *= 40.0;
+        detented = 1;
     }
 #else
     delta_x *= 40.0;
     delta_y *= 40.0;
+    detented = 1;
 #endif
     const uint32_t modifiers = native_sdk_gpu_modifier_flags(gtk_event_controller_get_current_event_state(GTK_EVENT_CONTROLLER(controller)));
-    native_sdk_emit_gpu_surface_input(view, NATIVE_SDK_GTK_GPU_INPUT_SCROLL, view->gpu_pointer_x, view->gpu_pointer_y, 0, delta_x, delta_y, "", "", modifiers);
+    /* BEGIN scroll-coalesce patch (zig-nostr/native) */
+    /* Accumulate and return. The whole cost of this handler is now an add,
+     * so GDK's input source drains its queue and goes quiet between events
+     * instead of staying ready across a dispatch that never ends. */
+    if (delta_x == 0.0 && delta_y == 0.0) return TRUE;
+    view->gpu_scroll_dx += delta_x;
+    view->gpu_scroll_dy += delta_y;
+    view->gpu_scroll_x = view->gpu_pointer_x;
+    view->gpu_scroll_y = view->gpu_pointer_y;
+    view->gpu_scroll_modifiers = modifiers;
+    /* A flush is detented only while EVERY event folded into it was: a
+     * frame that mixed a wheel notch with continuous input is not a detent,
+     * and treating it as one would ease a touchpad. */
+    view->gpu_scroll_all_detented = view->gpu_scroll_events == 0 ? detented : (view->gpu_scroll_all_detented && detented);
+    view->gpu_scroll_events++;
+    native_sdk_gpu_scroll_schedule_flush(view);
+    /* END scroll-coalesce patch */
     return TRUE;
 }
 
@@ -1692,6 +1826,12 @@ static void native_sdk_teardown_gpu_surface_view(native_sdk_gtk_native_view_t *v
         g_source_remove(view->gpu_emit_source);
         view->gpu_emit_source = 0;
     }
+    /* BEGIN scroll-coalesce patch (zig-nostr/native) */
+    if (view->gpu_scroll_source) {
+        g_source_remove(view->gpu_scroll_source);
+        view->gpu_scroll_source = 0;
+    }
+    /* END scroll-coalesce patch */
     if (view->widget && view->kind == NATIVE_SDK_GTK_VIEW_GPU_SURFACE) {
         gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(view->widget), NULL, NULL, NULL);
         g_signal_handlers_disconnect_by_data(view->widget, view);
@@ -4441,12 +4581,6 @@ int native_sdk_gtk_request_gpu_surface_frame(native_sdk_gtk_host_t *host, uint64
 }
 
 int native_sdk_gtk_present_gpu_surface_pixels(native_sdk_gtk_host_t *host, uint64_t window_id, const char *label, size_t label_len, size_t width, size_t height, double scale, int has_dirty_rect, double dirty_x, double dirty_y, double dirty_width, double dirty_height, const uint8_t *rgba8, size_t rgba8_len) {
-    (void)scale;
-    (void)has_dirty_rect;
-    (void)dirty_x;
-    (void)dirty_y;
-    (void)dirty_width;
-    (void)dirty_height;
     native_sdk_gtk_window_t *win = native_sdk_find_window(host, window_id);
     char *label_copy = label_len > 0 ? native_sdk_strndup(label, label_len) : NULL;
     native_sdk_gtk_native_view_t *view = native_sdk_find_native_view(win, label_copy);
@@ -4454,11 +4588,24 @@ int native_sdk_gtk_present_gpu_surface_pixels(native_sdk_gtk_host_t *host, uint6
     if (!view || view->kind != NATIVE_SDK_GTK_VIEW_GPU_SURFACE || !view->widget) return 0;
     if (!rgba8 || width == 0 || height == 0) return 0;
     if (width > INT_MAX || height > INT_MAX) return 0;
-    if (rgba8_len != width * height * 4) return 0;
+    if (width > SIZE_MAX / height || width * height > SIZE_MAX / 4 || rgba8_len != width * height * 4) return 0;
 
     const int stride = cairo_format_stride_for_width(CAIRO_FORMAT_ARGB32, (int)width);
     if (stride <= 0) return 0;
-    if (view->gpu_buf_width != (int)width || view->gpu_buf_height != (int)height || view->gpu_buf_stride != stride || !view->gpu_argb) {
+    /* Decide whether retained pixels are complete before changing the
+     * allocation or its metadata. A first or resized present must convert
+     * the entire surface even if its producer supplies incremental damage. */
+    const int retained_contents = native_sdk_gtk_pixels_can_reuse_buffer(
+        view->gpu_argb,
+        view->gpu_buf_width,
+        view->gpu_buf_height,
+        view->gpu_buf_stride,
+        width,
+        height,
+        stride
+    );
+    if (!retained_contents) {
+        if ((size_t)stride > SIZE_MAX / height) return 0;
         unsigned char *buffer = malloc((size_t)stride * height);
         if (!buffer) return 0;
         free(view->gpu_argb);
@@ -4468,21 +4615,21 @@ int native_sdk_gtk_present_gpu_surface_pixels(native_sdk_gtk_host_t *host, uint6
         view->gpu_buf_stride = stride;
     }
 
-    /* Straight RGBA8 -> premultiplied native-endian ARGB32 for cairo. */
-    for (size_t row = 0; row < height; row++) {
-        const uint8_t *src = rgba8 + row * width * 4;
-        uint32_t *dst = (uint32_t *)(view->gpu_argb + (size_t)row * (size_t)stride);
-        for (size_t col = 0; col < width; col++) {
-            const uint32_t r = src[col * 4 + 0];
-            const uint32_t g = src[col * 4 + 1];
-            const uint32_t b = src[col * 4 + 2];
-            const uint32_t a = src[col * 4 + 3];
-            const uint32_t pr = (r * a + 127) / 255;
-            const uint32_t pg = (g * a + 127) / 255;
-            const uint32_t pb = (b * a + 127) / 255;
-            dst[col] = (a << 24) | (pr << 16) | (pg << 8) | pb;
-        }
+    native_sdk_gtk_pixel_bounds_t conversion_bounds = native_sdk_gtk_pixels_full_bounds(width, height);
+    if (retained_contents) {
+        (void)native_sdk_gtk_pixels_dirty_bounds(
+            width,
+            height,
+            has_dirty_rect,
+            scale,
+            dirty_x,
+            dirty_y,
+            dirty_width,
+            dirty_height,
+            &conversion_bounds
+        );
     }
+    native_sdk_gtk_pixels_convert(view->gpu_argb, (size_t)stride, rgba8, width, conversion_bounds);
 
     const size_t sample_index = ((height / 2) * width + width / 2) * 4;
     const uint8_t sr = rgba8[sample_index + 0];

@@ -29,6 +29,7 @@
 //! false })` so the watch machinery compiles out too). Setting both keeps
 //! the compiled view until the watched file first changes on disk.
 
+const authorization = @import("authorization_policy.zig");
 const std = @import("std");
 const builtin = @import("builtin");
 const geometry = @import("geometry");
@@ -40,10 +41,15 @@ const core = @import("core.zig");
 const canvas_frame = @import("canvas_frame.zig");
 const canvas_limits = @import("canvas_limits.zig");
 const canvas_widget_events = @import("canvas_widget_events.zig");
+const drag_policy = @import("canvas_drag_policy.zig");
+const dispatch_policy = @import("app_dispatch_policy.zig");
+const component_policy = @import("component_policy.zig");
+const hover_policy = @import("canvas_hover_policy.zig");
 const launch_timing = @import("launch_timing.zig");
 const runtime_effects = @import("effects.zig");
 const terminal_session = @import("terminal_session.zig");
 const ui_app_provenance = @import("ui_app_provenance.zig");
+const markup_development = @import("markup_development_policy.zig");
 
 const Runtime = core.Runtime;
 const App = core.App;
@@ -96,6 +102,9 @@ pub const UiAppFeatures = struct {
     /// `canvas.CompiledMarkupView` so no parser code (or its diagnostics)
     /// ships in the binary; the markup machinery then compiles to nothing.
     runtime_markup: bool = true,
+    /// Generated TypeScript views observe compiled state directly. This
+    /// selects their stateless host handle instead of a decoded model mirror.
+    compiled_model: bool = false,
 };
 
 pub fn UiApp(comptime ModelT: type, comptime MsgT: type) type {
@@ -175,7 +184,9 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// family.
         pub const FontRegistration = struct {
             /// App-chosen id, at or above `canvas.min_registered_font_id`
-            /// (lower ids are reserved for built-in faces). Permanent for
+            /// (lower ids are reserved for built-in faces, except the four
+            /// sans variant ids `canvas.isFillableReservedFontId` names).
+            /// Permanent for
             /// the app's lifetime; store it in tokens, not handles.
             id: canvas.FontId,
             /// Human name for teaching errors — the asset's file name is
@@ -193,7 +204,8 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             /// BUDGET instead: `build` may emit any count up to it.
             prefix_commands: usize,
             /// Number of chrome commands preserved after the
-            /// widget-generated commands. Always exact.
+            /// widget-generated commands. Exact with the combined builder;
+            /// a budget when build_suffix supplies a separate derived layer.
             suffix_commands: usize = 0,
             /// The prefix length is whatever `build` emitted this
             /// rebuild (minus the fixed suffix) rather than an exact
@@ -209,6 +221,9 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             /// commands (up to `prefix_commands` under
             /// `variable_prefix`).
             build: *const fn (model: *const ModelT, builder: *canvas.Builder, size: geometry.SizeF, tokens: canvas.DesignTokens) anyerror!void,
+            /// Optional independent suffix. The first builder supplies only
+            /// the prefix; both actual lengths are retained on every rebuild.
+            build_suffix: ?*const fn (model: *const ModelT, builder: *canvas.Builder, size: geometry.SizeF, tokens: canvas.DesignTokens) anyerror!void = null,
         };
 
         /// A live webview region hosted alongside the canvas — the "both
@@ -292,6 +307,10 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             pack: ?canvas.ThemePack = null,
             color_scheme: ThemeColorScheme = .system,
             accent: ?canvas.Color = null,
+            /// Omission follows the OS; explicit values retain observed
+            /// accessibility appearance in the model during replay.
+            high_contrast: ?bool = null,
+            reduce_motion: ?bool = null,
             /// Adapter-only invalid declaration marker. Zig cores already
             /// pass a typed Color; the TS adapter retains malformed source
             /// text here so rebuild rejects it instead of silently inheriting.
@@ -479,8 +498,51 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         };
 
         pub const Options = struct {
+            /// Resolve authored PTY names without exposing engine identities.
+            pty_key_resolver: ?*const fn ([]const u8) u64 = null,
             name: []const u8,
             scene: app_manifest.ShellConfig,
+            /// Portable dispatch/drain scheduling. Native owns messages,
+            /// queue boundaries, errors and capability execution; plans copy.
+            replay_policy: ?*const fn ([]const u8, []u8) usize = null,
+            recording_policy: ?*const fn ([]const u8, []u8) usize = null,
+            blob_policy: ?*const fn ([]const u8, []u8) usize = null,
+            app_dispatch_policy: dispatch_policy.Policy = null,
+            /// Portable context-menu and scroll coordination; native owns pins and latches.
+            component_policy: component_policy.Policy = null,
+            /// Portable construction is owned by the compiled app; the
+            /// builder copies descriptors into its existing generation arena.
+            composition_policy: ?canvas.ComponentCompositionPolicy.Policy = null,
+            code_content_policy: ?canvas.CodeContentPolicy.Policy = null,
+            paragraph_policy: ?*const fn ([]const u8, []u8) usize = null,
+            text_run_policy: ?*const fn ([]const u8, []u8) usize = null,
+            chart_content_policy: ?canvas.ChartContentPolicy.Policy = null,
+            markdown_content_policy: ?canvas.MarkdownContentPolicy.Policy = null,
+            construction_policy: ?canvas.ComponentConstructionPolicy.Policy = null,
+            shell_layout_policy: ?*const fn ([]const u8, []u8) usize = null,
+            view_coordination_policy: ?*const fn ([]const u8, []u8) usize = null,
+            window_lifecycle_policy: ?*const fn ([]const u8, []u8) usize = null,
+            image_registry_policy: ?*const fn ([]const u8, []u8) usize = null,
+            font_registry_policy: ?*const fn ([]const u8, []u8) usize = null,
+            shell_coordination_policy: ?*const fn ([]const u8, []u8) usize = null,
+            shell_admission_policy: ?*const fn ([]const u8, []u8) usize = null,
+            system_admission_policy: ?*const fn ([]const u8, []u8) usize = null,
+            bridge_descriptor_policy: ?*const fn ([]const u8, []u8) usize = null,
+            authorization_policy: ?*const fn ([]const u8, []u8) usize = null,
+            builtin_coordination_policy: ?*const fn ([]const u8, []u8) usize = null,
+            automation_command_policy: ?*const fn ([]const u8, []u8) usize = null,
+            automation_interaction_policy: ?*const fn ([]const u8, []u8) usize = null,
+            snapshot_policy: ?*const fn ([]const u8, []u8) usize = null,
+            host_flow_policy: ?*const fn ([]const u8, []u8) usize = null,
+            /// Copied root/fragment reload and complete provenance programs.
+            markup_development_policy: markup_development.Policy = null,
+            /// Installed by TsUiApp for compiled command and status policy.
+            command_policy: ?*const fn ([]const u8, []u8) usize = null,
+            text_cache_policy: ?*const fn ([]const u8, []u8) usize = null,
+            render_cache_policy: ?*const fn ([]const u8, []u8) usize = null,
+            render_plan_policy: ?*const fn ([]const u8, []u8) usize = null,
+            render_override_policy: ?*const fn ([]const u8, []u8) usize = null,
+            render_damage_policy: ?*const fn ([]const u8, []u8) usize = null,
             canvas_label: []const u8,
             /// Fixed design tokens for an app that owns its look. Leave
             /// null (the default) and the stock tokens FOLLOW THE SYSTEM
@@ -495,6 +557,26 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             /// scale afterwards: the model owns scheme/contrast/motion,
             /// the runtime owns the surface scale.
             tokens_fn: ?*const fn (model: *const ModelT) canvas.DesignTokens = null,
+            /// Portable surface placement over native measurements, independent of theme overrides.
+            surface_layout_policy: ?*const fn ([]const u8, []u8) usize = null,
+            grid_layout_policy: ?*const fn ([]const u8, []u8) usize = null,
+            container_layout_policy: ?*const fn ([]const u8, []u8) usize = null,
+            measurement_coordination_policy: ?*const fn ([]const u8, []u8) usize = null,
+            flow_measurement_policy: ?*const fn ([]const u8, []u8) usize = null,
+            layout_coordination_policy: ?*const fn ([]const u8, []u8) usize = null,
+            render_coordination_policy: ?*const fn ([]const u8, []u8) usize = null,
+            control_command_policy: ?*const fn ([]const u8, []u8) usize = null,
+            intrinsic_layout_policy: ?*const fn ([]const u8, []u8) usize = null,
+            widget_motion_policy: ?*const fn ([]const u8, []u8) usize = null,
+            widget_audit_policy: ?*const fn ([]const u8, []u8) usize = null,
+            accessibility_policy: ?*const fn ([]const u8, []u8) usize = null,
+            widget_routing_policy: ?*const fn ([]const u8, []u8) usize = null,
+            widget_change_policy: ?*const fn ([]const u8, []u8) usize = null,
+            widget_paint_policy: ?*const fn ([]const u8, []u8) usize = null,
+            widget_presentation_policy: ?*const fn ([]const u8, []u8) usize = null,
+            terminal_paint_policy: ?*const fn ([]const u8, []u8) usize = null,
+            widget_paint_walk_policy: ?*const fn ([]const u8, []u8) usize = null,
+            control_geometry_policy: ?*const fn ([]const u8, []u8) usize = null,
             /// Which built-in theme pack the stock tokens resolve when
             /// the app claims neither `tokens` nor `tokens_fn`: the
             /// pack composes with the live system appearance (scheme,
@@ -517,6 +599,10 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             /// is mutually exclusive with it. Explicit `tokens_fn`/`tokens`
             /// still own the complete register and take precedence.
             theme_state_fn: ?*const fn (model: *const ModelT) ThemeState = null,
+            /// Model-derived overrides over the resolved stock register.
+            /// Explicit complete tokens retain precedence; device scale and
+            /// native measurement capabilities remain runtime-owned.
+            token_overrides_fn: ?*const fn (model: *const ModelT) canvas.DesignTokenOverrides = null,
             /// The app's ONE-accent brand statement over the stock
             /// tokens: when set (and the app claims neither `tokens`
             /// nor `tokens_fn` — apps that own their tokens own their
@@ -529,6 +615,9 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             /// this to app.zon's `theme_accent` field through
             /// `app_runner.manifestThemeAccent()`.
             theme_accent: ?canvas.Color = null,
+            /// Optional portable stock-theme policy. Inputs carry explicit
+            /// presence/appearance facts; copied results retain dispatch lifetime.
+            theme_policy: ?*const fn ([]const u8, []u8) usize = null,
             /// App font faces registered once, on the installing frame,
             /// BEFORE the first view build — so the very first layout
             /// already measures (and the first paint inks) with them.
@@ -605,6 +694,8 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             /// Optional mapping from shell command events (menus, shortcuts,
             /// native controls) into messages.
             on_command: ?*const fn (name: []const u8) ?MsgT = null,
+            /// A source window's label is input context, reduced before its event.
+            on_window_context: ?*const fn (model: *const ModelT, label: []const u8) ?MsgT = null,
             /// Optional mapping from app lifecycle events into messages.
             /// A single-window app can use activate/deactivate as its
             /// keyboard-focus signal for custom canvas chrome whose
@@ -787,6 +878,9 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             /// macOS-proven (`NSStatusItem`); platforms without a
             /// status-bar service log a warning and continue.
             status_item: ?StatusItemOptions = null,
+            /// Optional portable reconciliation. Requests borrow native facts;
+            /// results are copied without resetting the current dispatch frame.
+            status_policy: ?*const fn ([]const u8, []u8) usize = null,
             /// Model-derived status-item title and menu (e.g. an
             /// open-count badge in the menu bar, a latest-items
             /// dropdown), the `web_panes` pattern: consulted on install
@@ -819,6 +913,23 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             /// no close Msg. Reconcile failures degrade to logged warnings
             /// — a failed create never takes the render loop down.
             windows_fn: ?*const fn (model: *const ModelT, scratch: *WindowsScratch) []const WindowDescriptor = null,
+            /// Optional portable reconciliation over native-owned window
+            /// facts. The callback copies its output; rebuild/view consumers
+            /// retain ownership of the compiler frame and descriptor storage.
+            window_policy: ?*const fn (request: []const u8, output: []u8) usize = null,
+            /// Optional portable hold coordination; native retains timer
+            /// capabilities, armed identities and owned handler tables.
+            press_hold_policy: ?*const fn (request: []const u8, output: []u8) usize = null,
+            /// Portable Tab order over retained-tree facts. Native keeps
+            /// identities, measured eligibility, reveal and OS focus.
+            tab_focus_policy: ?*const fn (request: []const u8, output: []u8) usize = null,
+            /// Portable anchored-surface selection; native retains paint
+            /// facts, identities and dismissal/focus side effects.
+            surface_scope_policy: ?*const fn (request: []const u8, output: []u8) usize = null,
+            /// Portable return-target selection for dismissed/unmounted surfaces.
+            focus_return_policy: ?*const fn (request: []const u8, output: []u8) usize = null,
+            /// Portable tooltip ownership and adoption-time binding survival.
+            tooltip_policy: ?*const fn (request: []const u8, output: []u8) usize = null,
             /// Per-window view for declared secondary windows, keyed by
             /// the descriptor's window label — the `view` seam with the
             /// window identity alongside. Rebuilt for every open window
@@ -1344,6 +1455,8 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             return .{
                 .model = model,
                 .options = options,
+                .provenance = if (comptime features.runtime_markup) .{ .policy = options.markup_development_policy, .allocator = backing } else {},
+                .provenance_closure = if (comptime features.runtime_markup) .{ .policy = options.markup_development_policy } else {},
                 .backing = backing,
                 .arenas = .{
                     std.heap.ArenaAllocator.init(backing),
@@ -1410,6 +1523,8 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             self.* = .{
                 .model = undefined,
                 .options = options,
+                .provenance = if (comptime features.runtime_markup) .{ .policy = options.markup_development_policy, .allocator = backing } else {},
+                .provenance_closure = if (comptime features.runtime_markup) .{ .policy = options.markup_development_policy } else {},
                 .backing = backing,
                 .arenas = .{
                     std.heap.ArenaAllocator.init(backing),
@@ -1474,9 +1589,33 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 .context = self,
                 .name = self.options.name,
                 .scene_fn = sceneFn,
+                .shell_layout_policy = self.options.shell_layout_policy,
+                .view_coordination_policy = self.options.view_coordination_policy,
+                .window_lifecycle_policy = self.options.window_lifecycle_policy,
+                .image_registry_policy = self.options.image_registry_policy,
+                .font_registry_policy = self.options.font_registry_policy,
+                .shell_coordination_policy = self.options.shell_coordination_policy,
+                .shell_admission_policy = self.options.shell_admission_policy,
+                .system_admission_policy = self.options.system_admission_policy,
+                .bridge_descriptor_policy = self.options.bridge_descriptor_policy,
+                .authorization_policy = self.options.authorization_policy,
+                .builtin_coordination_policy = self.options.builtin_coordination_policy,
+                .automation_command_policy = self.options.automation_command_policy,
+                .automation_interaction_policy = self.options.automation_interaction_policy,
+                .snapshot_policy = self.options.snapshot_policy,
+                .host_flow_policy = self.options.host_flow_policy,
+                .command_policy = self.options.command_policy,
+                .text_cache_policy = self.options.text_cache_policy,
+                .render_cache_policy = self.options.render_cache_policy,
+                .render_plan_policy = self.options.render_plan_policy,
+                .render_override_policy = self.options.render_override_policy,
+                .render_damage_policy = self.options.render_damage_policy,
                 .event_fn = eventFn,
                 .stop_fn = stopFn,
                 .replay_fn = replayFn,
+                .replay_policy = self.options.replay_policy,
+                .recording_policy = self.options.recording_policy,
+                .blob_policy = self.options.blob_policy,
             };
         }
 
@@ -1502,6 +1641,8 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// image registry, window verbs, and — while a session is being
         /// recorded — the recorder's result journal.
         fn bindEffectsChannel(self: *Self, runtime: *Runtime) void {
+            self.effects.defer_desktop_capabilities = true;
+            self.effects.system_admission_policy = self.options.system_admission_policy;
             self.effects.bindServices(&runtime.options.platform.services);
             self.effects.bindEnviron(runtime.options.environ);
             if (runtime.options.record_store) |binding| {
@@ -1514,7 +1655,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 .services = &runtime.options.platform.services,
                 .service = runtime.options.platform.app_info.bundle_id,
                 .permitted = runtime.options.credentials_enabled and
-                    security.hasPermission(runtime.options.security.permissions, security.permission_credentials),
+                    authorization.hasPermission(runtime.authorization_policy, runtime.options.security.permissions, security.permission_credentials),
             });
             if (runtime.options.file_access) |binding| {
                 self.effects.bindFileAccess(binding);
@@ -1524,7 +1665,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 // fake file requests must park without consulting live paths.
                 self.effects.bindFileAccess(.{
                     .roots = &.{},
-                    .permitted = security.hasPermission(runtime.options.security.permissions, security.permission_filesystem),
+                    .permitted = authorization.hasPermission(runtime.authorization_policy, runtime.options.security.permissions, security.permission_filesystem),
                     .enforce = true,
                 });
             }
@@ -1544,8 +1685,11 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 .open_external_url_fn = effectsOpenExternalUrl,
                 .reveal_path_fn = effectsRevealPath,
                 .format_local_time_fn = effectsFormatLocalTime,
+                .execute_capability_fn = effectsExecuteCapability,
+                .replay_window_result_fn = effectsRestoreWindowResult,
             });
             if (runtime.options.session_recorder) |recorder| {
+                if (self.options.recording_policy) |policy| recorder.recording_policy = policy;
                 self.effects.bindJournal(recorder.effectJournal());
             }
             // The terminal-session seams (no-ops on stub builds): the
@@ -1593,7 +1737,11 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                     .exit => {
                         if (record.payload.len > 0) try self.effects.feedOutput(record.key, record.payload);
                         if (record.stderr_tail.len > 0) try self.effects.feedStderr(record.key, record.stderr_tail);
-                        try self.effects.feedExitReason(record.key, record.code, record.exit_reason);
+                        try self.effects.feedExitWithMetadata(record.key, record.code, record.exit_reason, .{
+                            .output_truncated = record.output_truncated,
+                            .stderr_truncated = record.stderr_truncated,
+                            .dropped_lines = record.dropped,
+                        });
                     },
                     .response => try self.effects.feedResponseOutcomeWithMetadata(
                         record.key,
@@ -1619,6 +1767,8 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                     // `.rejected` and regenerate from the same
                     // deterministic validation, like `.timer` records.
                     .host => try self.effects.feedHostResult(record.key, record.code == 0, record.payload),
+                    .window_execution => try self.effects.pushReplayWindowExecution(record),
+                    .channel_source => try self.effects.pushReplayChannelSource(record),
                     .credentials => try self.effects.feedCredentialsResult(
                         record.key,
                         record.credentials_operation,
@@ -1700,13 +1850,15 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                         // is still divergent input).
                         .write => try self.effects.pushReplayPtyWriteVerdict(record.key, record.code == 1),
                     },
-                    // Spectrum records feed through the band-carrying
-                    // helper so replay repaints identical bars; every
-                    // other audio kind rides the plain shape.
-                    .audio => if (record.audio_kind == .spectrum)
-                        try self.effects.feedAudioSpectrum(record.audio_bands, record.audio_position_ms, record.audio_duration_ms)
-                    else
-                        try self.effects.feedAudioEventBuffering(record.audio_kind, record.audio_position_ms, record.audio_duration_ms, record.audio_playing, record.audio_buffering),
+                    .audio => try self.effects.feedAudioRecord(.{
+                        .key = record.key,
+                        .kind = record.audio_kind,
+                        .position_ms = record.audio_position_ms,
+                        .duration_ms = record.audio_duration_ms,
+                        .playing = record.audio_playing,
+                        .buffering = record.audio_buffering,
+                        .bands = record.audio_bands,
+                    }),
                     // `.video` records feed the whole journaled shape —
                     // dimensions included — routed by the journaled
                     // load identity (`video_token`), so replay delivers
@@ -1746,120 +1898,110 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// widget state is synced into the model first so `update` sees
         /// current slider values and scroll offsets.
         pub fn dispatch(self: *Self, runtime: *Runtime, window_id: platform.WindowId, msg: MsgT) anyerror!void {
-            self.bindEffectsChannel(runtime);
-            self.syncModel(runtime, self.canvas_window_id);
-            self.applyMsg(msg);
-            self.publishAudioState(runtime);
-            // Before the installing frame there is nothing to render
-            // against: canvas size and scale arrive with the first frame
-            // event, and the installing rebuild renders whatever model
-            // state accumulated here. A pre-install rebuild is discarded
-            // work at a default surface size — and appearance/chrome
-            // events land before the first frame on every launch, so it
-            // used to cost a full view build on the launch path.
-            if (!self.installed) return;
-            // Hover edges the rebuilds produce (an unmounted hovered
-            // element's leave, an adoption re-hit-test's handoff)
-            // settle at this tail for DIRECT callers — command
-            // handlers, embedders, tests — without waiting for the
-            // next platform event, and on the REBUILD-ERROR path too:
-            // a failed secondary-window rebuild must not strand the
-            // leave the main rebuild already produced. Inside a runtime
-            // event the event's own tail drains instead, and the
-            // drain's own dispatches re-enter here guarded.
-            var rebuild_error: ?anyerror = null;
-            self.rebuild(runtime, self.canvas_window_id) catch |err| {
-                rebuild_error = err;
-            };
-            if (rebuild_error == null) self.rebuildWindowSlots(runtime) catch |err| {
-                rebuild_error = err;
-            };
-            if (self.hover_msg_event_depth == 0 and !self.hover_msg_draining) {
-                self.drainHoverMsgs(runtime) catch |err| {
-                    if (rebuild_error == null) rebuild_error = err;
-                };
+            for (self.dispatchPlan(.dispatch_begin, false, false)) |byte| {
+                switch (@as(dispatch_policy.Action, @enumFromInt(byte))) {
+                    .end => break,
+                    .bind => self.bindEffectsChannel(runtime),
+                    .sync => self.syncModel(runtime, self.canvas_window_id),
+                    .apply => self.applyMsg(msg),
+                    .audio => self.publishAudioState(runtime),
+                    else => @panic("unexpected dispatch preparation action"),
+                }
             }
-            if (rebuild_error) |err| return err;
-            // A Msg dispatched FROM a secondary window still rebuilt the
-            // main canvas above (one model, every window's view derives
-            // from it); `window_id` names the dispatch origin for apps
-            // that inspect it, not the rebuild target.
+            // Installation is sampled after update, as in the native loop.
+            const render = self.dispatchPlan(.dispatch_render, self.installed, false);
+            if (render[0] == 0) return;
+            var first_error: ?anyerror = null;
+            try self.executeRebuildPlan(runtime, render, &first_error);
+            try self.settleDispatch(runtime, &first_error);
             _ = window_id;
         }
 
-        /// Run `update` through whichever form the app declared; the
-        /// effects channel rides along for the `update_fx` form.
-        fn applyMsg(self: *Self, msg: MsgT) void {
-            if (self.options.update_fx) |update_fx| {
-                update_fx(&self.model, msg, &self.effects);
-            } else {
-                self.options.update.?(&self.model, msg);
-            }
-            // One update call is one complete command batch. Re-run live
-            // relational reads only after the batch has walked so several
-            // writes touching the same table still coalesce into one result.
-            self.effects.flushDbSubscriptions();
+        fn dispatchPlan(self: *Self, stage: dispatch_policy.Stage, a: bool, b: bool) dispatch_policy.Plan {
+            return dispatch_policy.plan(self.options.app_dispatch_policy, stage, @intFromBool(a), @intFromBool(b));
         }
 
-        /// Drain the effect completion queue on the loop thread: every
-        /// queued line/exit becomes a Msg through its stored constructor
-        /// and runs through `update`; one rebuild follows. Called on
-        /// `.effects_wake` (the platform marshalled a worker's `wake_fn`
-        /// nudge) and each presented frame (host-pumped embeds have no
-        /// wake delivery; their frame pump drains naturally).
+        fn selectDispatchError(self: *Self, first: *?anyerror, next: ?anyerror) void {
+            const plan = self.dispatchPlan(.error_selection, first.* != null, next != null);
+            for (plan) |byte| switch (@as(dispatch_policy.Action, @enumFromInt(byte))) {
+                .end => break,
+                .take_error => first.* = next,
+                else => @panic("unexpected dispatch error action"),
+            };
+        }
+
+        fn executeRebuildPlan(self: *Self, runtime: *Runtime, plan: dispatch_policy.Plan, first: *?anyerror) anyerror!void {
+            for (plan) |byte| switch (@as(dispatch_policy.Action, @enumFromInt(byte))) {
+                .end => break,
+                .main => {
+                    self.rebuild(runtime, self.canvas_window_id) catch |err| self.selectDispatchError(first, err);
+                    const secondary = self.dispatchPlan(.secondary, first.* != null, false);
+                    for (secondary) |action| switch (@as(dispatch_policy.Action, @enumFromInt(action))) {
+                        .end => break,
+                        .secondary => self.rebuildWindowSlots(runtime) catch |err| self.selectDispatchError(first, err),
+                        else => @panic("unexpected secondary rebuild action"),
+                    };
+                },
+                .video_query => {
+                    const changed = !std.meta.eql(self.video_rendered_snapshot, self.effects.videoSnapshot());
+                    try self.executeRebuildPlan(runtime, self.dispatchPlan(.video_rebuild, changed, false), first);
+                },
+                else => @panic("unexpected rebuild action"),
+            };
+        }
+
+        fn settleDispatch(self: *Self, runtime: *Runtime, first: *?anyerror) anyerror!void {
+            const tail = self.dispatchPlan(.direct_tail, self.hover_msg_event_depth == 0, self.hover_msg_draining);
+            for (tail) |byte| switch (@as(dispatch_policy.Action, @enumFromInt(byte))) {
+                .end => break,
+                .hover => self.drainHoverMsgs(runtime) catch |err| self.selectDispatchError(first, err),
+                else => @panic("unexpected dispatch tail action"),
+            };
+            if (self.hover_msg_event_depth == 0 and !self.hover_msg_draining) self.effects.flushDesktopCapabilities();
+            if (first.*) |err| return err;
+        }
+
+        /// Execute a complete command batch before flushing relational reads.
+        fn applyMsg(self: *Self, msg: MsgT) void {
+            for (self.dispatchPlan(.update, self.options.update_fx != null, false)) |byte| switch (@as(dispatch_policy.Action, @enumFromInt(byte))) {
+                .end => break,
+                .update_fx => self.options.update_fx.?(&self.model, msg, &self.effects),
+                .update => self.options.update.?(&self.model, msg),
+                .relational_flush => self.effects.flushDbSubscriptions(),
+                else => @panic("unexpected update action"),
+            };
+        }
+
+        /// Consume a captured causal boundary. Completions created by these
+        /// updates remain queued for the next pass, with native-owned identities.
         pub fn drainEffects(self: *Self, runtime: *Runtime) anyerror!void {
-            if (!self.installed) return;
-            if (!self.effects.hasPending()) return;
-            self.bindEffectsChannel(runtime);
-            self.syncModel(runtime, self.canvas_window_id);
+            const admission = self.dispatchPlan(.drain_installed, self.installed, false);
+            var pending = false;
+            for (admission) |byte| switch (@as(dispatch_policy.Action, @enumFromInt(byte))) {
+                .end => break,
+                .pending_query => pending = self.effects.hasPending(),
+                else => @panic("unexpected effect admission action"),
+            };
+            const begin = self.dispatchPlan(.drain_pending, pending, false);
+            if (begin[0] == 0) return;
             var dispatched = false;
-            // One pass consumes only completions that existed when it
-            // began: a load started by an update handler in THIS pass
-            // that finishes while the pass still runs waits for the wake
-            // its producer already nudged. That keeps the session
-            // journal's event boundaries causal — every result recorded
-            // ahead of this wake's event record answers a request from
-            // an earlier dispatch, so replay's file-order feed always
-            // finds the parked request (see Effects.DrainBoundary).
-            var boundary = self.effects.drainBoundary();
-            while (self.effects.takeMsgWithin(&boundary)) |msg| {
-                self.applyMsg(msg);
-                dispatched = true;
-            }
-            self.publishAudioState(runtime);
-            var rebuild_error: ?anyerror = null;
-            if (dispatched) {
-                self.rebuild(runtime, self.canvas_window_id) catch |err| {
-                    rebuild_error = err;
-                };
-                if (rebuild_error == null) self.rebuildWindowSlots(runtime) catch |err| {
-                    rebuild_error = err;
-                };
-            } else if (self.installed and
-                !std.meta.eql(self.video_rendered_snapshot, self.effects.videoSnapshot()))
-            {
-                // A drained Msg-less video terminal (a handler-less
-                // declarative playback's synchronous failure) moved
-                // the mirrors after the last build rendered them:
-                // re-render the chrome so its controls never keep
-                // advertising a playback that is gone.
-                self.rebuild(runtime, self.canvas_window_id) catch |err| {
-                    rebuild_error = err;
-                };
-                if (rebuild_error == null) self.rebuildWindowSlots(runtime) catch |err| {
-                    rebuild_error = err;
-                };
-            }
-            // Same tail as `dispatch`, same error-path duty: effect-
-            // driven rebuilds settle the hover edges they produced
-            // (this path is also public — host-pumped embeds call it
-            // directly).
-            if (self.hover_msg_event_depth == 0 and !self.hover_msg_draining) {
-                self.drainHoverMsgs(runtime) catch |err| {
-                    if (rebuild_error == null) rebuild_error = err;
-                };
-            }
-            if (rebuild_error) |err| return err;
+            for (begin) |byte| switch (@as(dispatch_policy.Action, @enumFromInt(byte))) {
+                .end => break,
+                .bind => self.bindEffectsChannel(runtime),
+                .sync => self.syncModel(runtime, self.canvas_window_id),
+                .capture_drain => {
+                    var boundary = self.effects.drainBoundary();
+                    while (self.effects.takeMsgWithin(&boundary)) |msg| {
+                        self.applyMsg(msg);
+                        dispatched = true;
+                    }
+                },
+                .audio => self.publishAudioState(runtime),
+                else => @panic("unexpected effect drain action"),
+            };
+            var first_error: ?anyerror = null;
+            try self.executeRebuildPlan(runtime, self.dispatchPlan(.drain_rebuild, dispatched, self.installed), &first_error);
+            try self.settleDispatch(runtime, &first_error);
         }
 
         /// Mirror the effects channel's audio playback state into the
@@ -1901,6 +2043,39 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             runtime.video_height = video.height;
         }
 
+        const ThemeControl = struct { mode: u8, follows_system: bool, derives: bool };
+
+        fn themeControl(self: *const Self, scheme: ThemeColorScheme) ThemeControl {
+            const full_tokens = self.options.tokens_fn != null or self.options.tokens != null;
+            if (self.options.theme_policy) |policy| {
+                const request = [_]u8{ 2, @intFromBool(self.options.tokens_fn != null), @intFromBool(self.options.tokens != null), @intFromBool(self.options.theme_state_fn != null), themeSchemeByte(scheme), @intFromBool(self.options.token_overrides_fn != null) };
+                var result: [4]u8 = undefined;
+                if (policy(&request, &result) != result.len or result[0] > 2 or result[1] > 1 or result[2] > 1) @panic("invalid compiled theme control result");
+                return .{ .mode = result[0], .follows_system = result[1] == 1, .derives = result[2] == 1 };
+            }
+            const follows = !full_tokens and (self.options.theme_state_fn == null or scheme == .system);
+            return .{
+                .mode = if (self.options.tokens_fn != null) 1 else if (self.options.tokens != null) 2 else 0,
+                .follows_system = follows,
+                .derives = self.options.tokens_fn != null or self.options.theme_state_fn != null or self.options.token_overrides_fn != null or follows,
+            };
+        }
+
+        fn themeSchemeByte(scheme: ThemeColorScheme) u8 {
+            return switch (scheme) {
+                .system => 0,
+                .light => 1,
+                .dark => 2,
+            };
+        }
+
+        fn themePackByte(pack: canvas.ThemePack) u8 {
+            return switch (pack) {
+                .house => 1,
+                .geist => 2,
+            };
+        }
+
         /// The design tokens for the next rebuild: the model-derived
         /// `tokens_fn`, explicit static `tokens`, or — the default — the
         /// stock theme derived from the SYSTEM appearance the runtime
@@ -1910,42 +2085,105 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// appearance, the runtime owns the device scale — so static
         /// tokens snap hairlines against the real surface density too.
         pub fn effectiveTokens(self: *const Self) canvas.DesignTokens {
-            if (self.options.tokens_fn) |tokens_fn| {
-                var tokens = tokens_fn(&self.model);
+            const control = self.themeControl(.system);
+            if (control.mode != 0) {
+                var tokens = switch (control.mode) {
+                    1 => self.options.tokens_fn.?(&self.model),
+                    2 => self.options.tokens.?,
+                    else => unreachable,
+                };
                 tokens.pixel_snap.scale = self.pixel_snap_scale;
-                return tokens;
-            }
-            if (self.options.tokens) |static_tokens| {
-                var tokens = static_tokens;
-                tokens.pixel_snap.scale = self.pixel_snap_scale;
+                tokens.surface_layout_policy = self.options.surface_layout_policy;
+                tokens.grid_layout_policy = self.options.grid_layout_policy;
+                tokens.container_layout_policy = self.options.container_layout_policy;
+                tokens.intrinsic_layout_policy = self.options.intrinsic_layout_policy;
+                tokens.measurement_coordination_policy = self.options.measurement_coordination_policy;
+                tokens.flow_measurement_policy = self.options.flow_measurement_policy;
+                tokens.layout_coordination_policy = self.options.layout_coordination_policy;
+                tokens.render_coordination_policy = self.options.render_coordination_policy;
+                tokens.control_command_policy = self.options.control_command_policy;
+                tokens.widget_motion_policy = self.options.widget_motion_policy;
+                tokens.widget_audit_policy = self.options.widget_audit_policy;
+                tokens.accessibility_policy = self.options.accessibility_policy;
+                tokens.widget_routing_policy = self.options.widget_routing_policy;
+                tokens.widget_change_policy = self.options.widget_change_policy;
+                tokens.widget_paint_policy = self.options.widget_paint_policy;
+                tokens.widget_presentation_policy = self.options.widget_presentation_policy;
+                tokens.widget_paint_walk_policy = self.options.widget_paint_walk_policy;
+                tokens.terminal_paint_policy = self.options.terminal_paint_policy;
+                tokens.control_geometry_policy = self.options.control_geometry_policy;
+                tokens.code_content_policy = self.options.code_content_policy;
+                tokens.paragraph_policy = self.options.paragraph_policy;
+                tokens.text_run_policy = self.options.text_run_policy;
                 return tokens;
             }
             const state = self.currentThemeState();
-            const color_scheme: canvas.ColorScheme = switch (state.color_scheme) {
-                .system => switch (self.system_appearance.color_scheme) {
+            const high_contrast = state.high_contrast orelse self.system_appearance.high_contrast;
+            const reduce_motion = state.reduce_motion orelse self.system_appearance.reduce_motion;
+            // Preserve lazy legacy helper evaluation when a model pack exists.
+            const fallback_pack = if (state.pack == null and self.options.theme_fn != null) self.options.theme_fn.?(&self.model) else self.options.theme;
+            var pack: canvas.ThemePack = undefined;
+            var color_scheme: canvas.ColorScheme = undefined;
+            var accent: ?canvas.Color = undefined;
+            if (self.options.theme_policy) |policy| {
+                const request = [_]u8{
+                    1,                                   if (state.pack) |value| themePackByte(value) else 0,        themePackByte(fallback_pack),
+                    themeSchemeByte(state.color_scheme), @intFromBool(self.system_appearance.color_scheme == .dark), @intFromBool(high_contrast),
+                    @intFromBool(state.accent != null),  @intFromBool(self.options.theme_accent != null),
+                };
+                var result: [4]u8 = undefined;
+                if (policy(&request, &result) != result.len or result[0] < 1 or result[0] > 2 or result[1] > 1 or result[2] > 2) @panic("invalid compiled stock theme result");
+                pack = if (result[0] == 1) .house else .geist;
+                color_scheme = if (result[1] == 0) .light else .dark;
+                accent = switch (result[2]) {
+                    0 => null,
+                    1 => state.accent.?,
+                    2 => self.options.theme_accent.?,
+                    else => unreachable,
+                };
+            } else {
+                pack = state.pack orelse fallback_pack;
+                color_scheme = switch (state.color_scheme) {
+                    .system => switch (self.system_appearance.color_scheme) {
+                        .light => .light,
+                        .dark => .dark,
+                    },
                     .light => .light,
                     .dark => .dark,
-                },
-                .light => .light,
-                .dark => .dark,
-            };
+                };
+                accent = if (high_contrast) null else state.accent orelse self.options.theme_accent;
+            }
             var tokens = canvas.DesignTokens.theme(.{
                 .color_scheme = color_scheme,
-                .contrast = if (self.system_appearance.high_contrast) .high else .standard,
-                .reduce_motion = self.system_appearance.reduce_motion,
-                .pack = state.pack orelse if (self.options.theme_fn) |theme_fn| theme_fn(&self.model) else self.options.theme,
+                .contrast = if (high_contrast) .high else .standard,
+                .reduce_motion = reduce_motion,
+                .pack = pack,
             });
-            if (state.accent orelse self.options.theme_accent) |accent| {
-                // The manifest accent layers over the resolved pack —
-                // except under high contrast, where the pack's own loud
-                // register wins untouched (accessibility beats brand).
-                // The bundle takes the resolved scheme: the dark ring
-                // derives desaturated (canvas.accentFocusRing).
-                if (!self.system_appearance.high_contrast) {
-                    tokens = tokens.withOverrides(canvas.accentOverrides(accent, color_scheme));
-                }
-            }
+            if (accent) |value| tokens = tokens.withOverrides(canvas.accentOverrides(value, color_scheme));
+            if (self.options.token_overrides_fn) |overrides| tokens = tokens.withOverrides(overrides(&self.model));
             tokens.pixel_snap.scale = self.pixel_snap_scale;
+            tokens.surface_layout_policy = self.options.surface_layout_policy;
+            tokens.grid_layout_policy = self.options.grid_layout_policy;
+            tokens.container_layout_policy = self.options.container_layout_policy;
+            tokens.intrinsic_layout_policy = self.options.intrinsic_layout_policy;
+            tokens.measurement_coordination_policy = self.options.measurement_coordination_policy;
+            tokens.flow_measurement_policy = self.options.flow_measurement_policy;
+            tokens.layout_coordination_policy = self.options.layout_coordination_policy;
+            tokens.render_coordination_policy = self.options.render_coordination_policy;
+            tokens.control_command_policy = self.options.control_command_policy;
+            tokens.widget_motion_policy = self.options.widget_motion_policy;
+            tokens.widget_audit_policy = self.options.widget_audit_policy;
+            tokens.accessibility_policy = self.options.accessibility_policy;
+            tokens.widget_routing_policy = self.options.widget_routing_policy;
+            tokens.widget_change_policy = self.options.widget_change_policy;
+            tokens.widget_paint_policy = self.options.widget_paint_policy;
+            tokens.widget_presentation_policy = self.options.widget_presentation_policy;
+            tokens.widget_paint_walk_policy = self.options.widget_paint_walk_policy;
+            tokens.terminal_paint_policy = self.options.terminal_paint_policy;
+            tokens.control_geometry_policy = self.options.control_geometry_policy;
+            tokens.code_content_policy = self.options.code_content_policy;
+            tokens.paragraph_policy = self.options.paragraph_policy;
+            tokens.text_run_policy = self.options.text_run_policy;
             return tokens;
         }
 
@@ -1961,7 +2199,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             // Complete-token paths outrank the stock-theme helper entirely.
             // Do not even validate an unused model accent: the app has
             // explicitly claimed the whole DesignTokens register.
-            if (self.options.tokens_fn != null or self.options.tokens != null) {
+            if (self.themeControl(.system).mode != 0) {
                 self.theme_state = .{};
                 self.theme_state_known = true;
                 return;
@@ -1995,15 +2233,18 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// true only when the app claims neither token override, so an
         /// appearance flip must re-derive and re-render.
         fn followsSystemAppearance(self: *const Self) bool {
-            if (self.options.tokens_fn != null or self.options.tokens != null) return false;
-            if (self.options.theme_state_fn == null) return true;
-            return self.currentThemeState().color_scheme == .system;
+            // Preserve the reference helper's lazy evaluation and call count.
+            const scheme = if (self.options.tokens_fn == null and self.options.tokens == null and self.options.theme_state_fn != null)
+                self.currentThemeState().color_scheme
+            else
+                ThemeColorScheme.system;
+            return self.themeControl(scheme).follows_system;
         }
 
         /// Whether tokens are derived per rebuild (model-owned or
         /// system-followed) rather than a fixed set.
         fn derivesTokens(self: *const Self) bool {
-            return self.options.tokens_fn != null or self.options.theme_state_fn != null or self.followsSystemAppearance();
+            return self.themeControl(.system).derives;
         }
 
         /// Whether a rebuild must push its tokens into the runtime's
@@ -2053,6 +2294,20 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// window converges within the same rebuild instead of waiting
         /// for the next Msg.
         pub fn rebuild(self: *Self, runtime: *Runtime, window_id: platform.WindowId) anyerror!void {
+            for (runtime.windows[0..runtime.window_count]) |window| {
+                if (window.info.id == window_id and !window.info.open) {
+                    // The app and secondary windows survive a closed primary
+                    // canvas. Continue declaration reconciliation without
+                    // installing a tree into the removed native surface.
+                    self.tree = null;
+                    self.main_tree_current = false;
+                    self.releaseContextMenuSnapshotForWindow(window_id);
+                    try self.refreshThemeState();
+                    self.applyStatusItem(runtime);
+                    self.applyWindows(runtime);
+                    return;
+                }
+            }
             self.syncModel(runtime, window_id);
             try self.refreshThemeState();
             if (comptime features.runtime_markup) {
@@ -2107,7 +2362,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             // Apps whose headers already pad through the chrome
             // channel's insets never collide, never retry, and keep a
             // byte-identical layout.
-            if (windowControlsReservation(runtime, window_id, self.options.canvas_label, built.layout, tokens)) |controls| {
+            if (try windowControlsReservation(runtime, window_id, self.options.canvas_label, built.layout, tokens)) |controls| {
                 tokens.window_controls = controls;
                 built = try self.buildLayoutPass(runtime, window_id, bounds, tokens, next_index);
             }
@@ -2155,7 +2410,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             // The fallback menu's target vanished from this build (the
             // model dropped the row, or its menu emptied): the open state
             // has nothing to present, so it closes.
-            if (self.contextMenuFallbackTargetForLabel(self.options.canvas_label) != 0 and tree.context_menu_fallback == null) {
+            if (self.componentDecision(.fallback_vanished, self.contextMenuFallbackTargetForLabel(self.options.canvas_label) != 0, tree.context_menu_fallback != null, false) != 0) {
                 self.clearContextMenuFallback();
             }
             try self.scheduleAnimations(runtime, window_id);
@@ -2220,9 +2475,10 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 const content_height = @max(0, frame.height - inset.top - inset.bottom);
                 const metrics = canvas.terminalCellMetrics(tokens);
                 if (metrics.width <= 0 or metrics.height <= 0) continue;
-                const proposed = canvas.clampTerminalGrid(
+                const proposed = canvas.terminal_grid.clampGridWithPolicy(
                     @intFromFloat(@max(2, @floor(content_width / metrics.width))),
                     @intFromFloat(@max(2, @floor(content_height / metrics.height))),
+                    tokens.terminal_paint_policy,
                 );
                 const state = self.terminal_sessions.reconcile(
                     pty,
@@ -2329,6 +2585,11 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 std.debug.assert(if (self.context_menu_pin) |pin| pin.window_id != null or pin.arena_index != next_index else true);
                 _ = self.arenas[next_index].reset(.retain_capacity);
                 var ui = Ui.init(self.arenas[next_index].allocator());
+                ui.composition_policy = self.options.composition_policy;
+                ui.code_content_policy = self.options.code_content_policy;
+                ui.chart_content_policy = self.options.chart_content_policy;
+                ui.markdown_content_policy = self.options.markdown_content_policy;
+                ui.construction_policy = self.options.construction_policy;
                 // The house video chrome renders the channel's honest
                 // snapshot, stamped before the view fn runs — the model
                 // carries none of it.
@@ -2339,10 +2600,12 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 // driving the palette's theme mapping.
                 self.terminal_sessions.beginBuild(tokens);
                 ui.terminal_lookup = self.terminal_sessions.lookup();
+                ui.pty_key_resolver = self.options.pty_key_resolver;
                 ui.virtual_window_context = @ptrCast(&window_source);
                 ui.virtual_window_source = VirtualWindowResolver.resolve;
                 ui.virtual_extent_context = @ptrCast(self);
                 ui.virtual_extent_source = virtualExtentResolve;
+                ui.virtual_extent_policy = self.options.intrinsic_layout_policy;
                 ui.context_menu_fallback_target = self.contextMenuFallbackTargetForLabel(self.options.canvas_label);
                 if (ui.context_menu_fallback_target != 0) ui.context_menu_fallback_point = self.context_menu_fallback_point;
                 self.armUiFragmentHost(&ui);
@@ -2426,7 +2689,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// cluster. `tokens` must be the tokens the layout was built
         /// with: the scan re-measures text through the same seam to
         /// judge painted bounds, not frames.
-        fn windowControlsReservation(runtime: *Runtime, window_id: platform.WindowId, canvas_label: []const u8, layout: canvas.WidgetLayoutTree, tokens: canvas.DesignTokens) ?geometry.RectF {
+        fn windowControlsReservation(runtime: *Runtime, window_id: platform.WindowId, canvas_label: []const u8, layout: canvas.WidgetLayoutTree, tokens: canvas.DesignTokens) !?geometry.RectF {
             var has_drag_region = false;
             for (layout.nodes) |node| {
                 if (canvas.widgetIsWindowDragRegion(node.widget)) {
@@ -2435,7 +2698,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 }
             }
             if (!has_drag_region) return null;
-            const controls = runtime.windowControlsForView(window_id, canvas_label);
+            const controls = try runtime.windowControlsForView(window_id, canvas_label);
             if (controls.width <= 0 or controls.height <= 0) return null;
             if (!canvas.windowDragContentUnderWindowControls(layout.nodes, controls, tokens)) return null;
             return controls;
@@ -2548,7 +2811,12 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                     if (record.item_count == 0) continue;
                     const offset = @max(0, node.widget.value);
                     const first_visible = table.indexAtOffset(offset);
-                    const visible_end = @min(record.item_count, table.indexAtOffset(offset + viewport.height) + 1);
+                    const end_probe = table.indexAtOffset(offset + viewport.height);
+                    if (self.options.intrinsic_layout_policy) |policy| {
+                        if (canvas.virtual_extent_policy.undercovered(policy, record.item_count, first_visible, end_probe, record.overscan, record.start_index, record.end_index)) return true;
+                        continue;
+                    }
+                    const visible_end = @min(record.item_count, end_probe + 1);
                     const start = if (first_visible > record.overscan) first_visible - record.overscan else 0;
                     const end = @min(record.item_count, visible_end + record.overscan);
                     if (start < record.start_index or end > record.end_index) return true;
@@ -2590,6 +2858,17 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         }
 
         fn claimVirtualExtentTable(self: *Self, id: canvas.ObjectId) ?*canvas.VirtualExtentTable {
+            if (self.options.intrinsic_layout_policy) |policy| {
+                const decision = canvas.virtual_extent_policy.slot(policy, id, &self.virtual_extent_tables, self.virtual_windows[0..self.virtual_window_count]);
+                if (decision) |plan| {
+                    const table = &self.virtual_extent_tables[plan.index];
+                    if (plan.recycle) table.reset();
+                    table.policy = policy;
+                    return table;
+                }
+                if (id != 0) ui_app_log.warn("variable-extent virtual list table budget exhausted; using estimates without measured corrections", .{});
+                return null;
+            }
             if (id == 0) return null;
             for (&self.virtual_extent_tables) |*table| {
                 if (table.id == id) return table;
@@ -2646,15 +2925,16 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 // the pending offset by however much the batch moves
                 // that edge, and the anchored row stays under the
                 // user's eyes.
-                table.beginCorrections(list_node.widget.layout.virtual_anchor_index, null);
+                var measurements: std.ArrayList(canvas.VirtualExtentMeasurement) = .empty;
+                defer measurements.deinit(std.heap.page_allocator);
                 for (layout.nodes) |node| {
                     const parent = node.parent_index orelse continue;
                     if (parent != list_index) continue;
                     if (node.widget.layout.anchor != null) continue;
                     const physical = node.widget.semantics.list_item_index orelse continue;
-                    table.recordMeasured(@intCast(physical), node.frame.normalized().height);
+                    measurements.append(std.heap.page_allocator, .{ .physical = @intCast(physical), .extent = node.frame.normalized().height }) catch @panic("virtual row measurement allocation failed");
                 }
-                table.endCorrections();
+                table.applyMeasurements(list_node.widget.layout.virtual_anchor_index, null, measurements.items);
                 if (@abs(table.pending_offset_delta) > virtual_correction_retry_threshold) corrected = true;
             }
             return corrected;
@@ -2679,25 +2959,6 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             axis: canvas.ScrollAxis = .vertical,
         };
 
-        const ReachAxis = struct {
-            state: canvas.ScrollAxisState,
-            axis: canvas.ScrollAxis,
-        };
-
-        /// The axis reach-end/reach-start measure: the vertical axis
-        /// wherever it has scrollable range (every pre-axis region, so
-        /// existing apps see identical behavior), otherwise the
-        /// horizontal one — a horizontal timeline's `on-reach-end` is
-        /// its right edge. One rule for both signals so "the end" and
-        /// "the start" always name the same axis.
-        fn reachAxisState(scroll_state: canvas.ScrollState) ReachAxis {
-            const vertical = scroll_state.axis(.vertical);
-            if (vertical.maxOffset() > 0) return .{ .state = vertical, .axis = .vertical };
-            const horizontal = scroll_state.axis(.horizontal);
-            if (horizontal.maxOffset() > 0) return .{ .state = horizontal, .axis = .horizontal };
-            return .{ .state = vertical, .axis = .vertical };
-        }
-
         /// Approach-end hysteresis (`on_reach_end`): fire when a scroll
         /// lands within `reach_end_fire_ratio` viewports of the content
         /// end and the region is armed; re-arm once the offset sits more
@@ -2705,22 +2966,24 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// appending a batch causes on its own, since the extent grows
         /// under the unchanged offset. One Msg per approach, never a
         /// fetch storm from a user riding the end of the list.
-        fn reachEndShouldFire(self: *Self, id: canvas.ObjectId, scroll_state: canvas.ScrollState) bool {
-            const reach = reachAxisState(scroll_state);
-            const axis_state = reach.state;
-            if (id == 0 or axis_state.viewport_extent <= 0) return false;
-            const remaining = axis_state.content_extent - axis_state.viewport_extent - axis_state.offset;
-            if (remaining > axis_state.viewport_extent * reach_end_rearm_ratio) {
-                self.clearReachEndFired(id, reach.axis);
-                return false;
+        fn applyReachPlan(self: *Self, start: bool, id: canvas.ObjectId, scroll_state: canvas.ScrollState) bool {
+            const vertical_fired = if (start) self.reachStartFired(id, .vertical) else self.reachEndFired(id, .vertical);
+            const horizontal_fired = if (start) self.reachStartFired(id, .horizontal) else self.reachEndFired(id, .horizontal);
+            const plan = component_policy.reach(self.options.component_policy, start, id != 0, scroll_state, vertical_fired, horizontal_fired);
+            const axis: canvas.ScrollAxis = if (plan.horizontal) .horizontal else .vertical;
+            switch (plan.action) {
+                .none => return false,
+                .clear => {
+                    if (start) self.clearReachStartFired(id, axis) else self.clearReachEndFired(id, axis);
+                    return false;
+                },
+                // Dispatch only after a native latch slot was actually stored.
+                .store => return if (start) self.markReachStartFired(id, axis) else self.markReachEndFired(id, axis),
             }
-            if (remaining > axis_state.viewport_extent * reach_end_fire_ratio) return false;
-            if (self.reachEndFired(id, reach.axis)) return false;
-            // Fire only when the latch STORES: an unstorable latch
-            // (table full — a degenerate tree) would otherwise fire on
-            // every observation, the exact storm the hysteresis exists
-            // to prevent. Silence is the safer failure.
-            return self.markReachEndFired(id, reach.axis);
+        }
+
+        fn reachEndShouldFire(self: *Self, id: canvas.ObjectId, scroll_state: canvas.ScrollState) bool {
+            return self.applyReachPlan(false, id, scroll_state);
         }
 
         fn reachEndFired(self: *const Self, id: canvas.ObjectId, axis: canvas.ScrollAxis) bool {
@@ -2757,18 +3020,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// only moves on scroll OBSERVATIONS, so a programmatic jump out
         /// of the band re-arms on the next user scroll, not instantly.
         fn reachStartShouldFire(self: *Self, id: canvas.ObjectId, scroll_state: canvas.ScrollState) bool {
-            const reach = reachAxisState(scroll_state);
-            const axis_state = reach.state;
-            if (id == 0 or axis_state.viewport_extent <= 0) return false;
-            const remaining = axis_state.offset;
-            if (remaining > axis_state.viewport_extent * reach_start_rearm_ratio) {
-                self.clearReachStartFired(id, reach.axis);
-                return false;
-            }
-            if (remaining > axis_state.viewport_extent * reach_start_fire_ratio) return false;
-            if (self.reachStartFired(id, reach.axis)) return false;
-            // Fire only when the latch stores (the reach-end rule).
-            return self.markReachStartFired(id, reach.axis);
+            return self.applyReachPlan(true, id, scroll_state);
         }
 
         fn reachStartFired(self: *const Self, id: canvas.ObjectId, axis: canvas.ScrollAxis) bool {
@@ -2810,6 +3062,13 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 declared = declared[0..max_ui_windows];
             }
 
+            if (self.options.window_policy != null) {
+                self.applyCompiledWindows(runtime, declared) catch |err| {
+                    ui_app_log.warn("window reconciliation failed: {s}", .{@errorName(err)});
+                };
+                return;
+            }
+
             // Close first: a label leaving the declared set frees its
             // slot (and its runtime window label) before creations run.
             var index: usize = 0;
@@ -2828,6 +3087,77 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                     continue;
                 }
                 self.createWindowSlot(runtime, descriptor);
+            }
+        }
+
+        fn writeWindowPolicyLabel(writer: *std.Io.Writer, label: []const u8) !void {
+            if (label.len > std.math.maxInt(u32)) return error.WindowPolicyLabelTooLong;
+            try writer.writeInt(u32, @intCast(label.len), .little);
+            try writer.writeAll(label);
+        }
+
+        /// Each decision sees the current ordered slots, including the swap
+        /// after a close and only successful OS creates. Copy the complete
+        /// request before entering scriptc; keep all descriptor bytes alive.
+        fn windowPolicyDecision(self: *Self, declared: []const WindowDescriptor, descriptor: ?WindowDescriptor) ![2]u8 {
+            comptime {
+                std.debug.assert(max_ui_windows == 4);
+                std.debug.assert(platform.max_window_label_bytes == 64);
+                std.debug.assert(app_manifest.max_view_label_bytes == 64);
+            }
+            var request = std.Io.Writer.Allocating.init(self.backing);
+            defer request.deinit();
+            const writer = &request.writer;
+            try writer.writeByte(@intFromBool(descriptor != null));
+            if (descriptor) |value| {
+                try writeWindowPolicyLabel(writer, self.options.canvas_label);
+                try writeWindowPolicyLabel(writer, value.label);
+                try writeWindowPolicyLabel(writer, value.canvas_label);
+            } else {
+                try writer.writeByte(@intCast(declared.len));
+                for (declared) |value| try writeWindowPolicyLabel(writer, value.label);
+            }
+            try writer.writeByte(@intCast(self.window_slot_count));
+            for (self.window_slots[0..self.window_slot_count]) |*slot| {
+                try writeWindowPolicyLabel(writer, slot.label());
+                try writeWindowPolicyLabel(writer, slot.canvasLabel());
+            }
+            var result: [2]u8 = undefined;
+            if (self.options.window_policy.?(request.written(), &result) != result.len or
+                result[0] > 4 or (result[1] != 255 and result[1] >= self.window_slot_count))
+                @panic("invalid compiled window policy result");
+            if (descriptor == null) {
+                if (result[0] != 0) @panic("invalid compiled window retirement result");
+            } else if ((result[0] == 1) == (result[1] == 255)) {
+                @panic("invalid compiled window declaration result");
+            }
+            return result;
+        }
+
+        fn applyCompiledWindows(self: *Self, runtime: *Runtime, declared: []const WindowDescriptor) !void {
+            while (true) {
+                const plan = try self.windowPolicyDecision(declared, null);
+                if (plan[1] == 255) break;
+                self.closeWindowSlot(runtime, plan[1]);
+            }
+            for (declared) |descriptor| {
+                const plan = try self.windowPolicyDecision(&.{}, descriptor);
+                switch (plan[0]) {
+                    0 => {
+                        // Bound native copies even if a custom callback violates
+                        // the ABI. Lookup/collision decisions belong to policy.
+                        if (self.window_slot_count >= max_ui_windows or
+                            descriptor.label.len == 0 or descriptor.label.len > platform.max_window_label_bytes or
+                            descriptor.canvas_label.len == 0 or descriptor.canvas_label.len > app_manifest.max_view_label_bytes)
+                            @panic("invalid compiled window creation result");
+                        self.openWindowSlot(runtime, descriptor);
+                    },
+                    1 => self.setWindowSlotOnClose(&self.window_slots[plan[1]], descriptor.on_close),
+                    2 => ui_app_log.warn("declared window '{s}' ignored: more than {d} secondary windows (canvas_limits.max_ui_app_windows)", .{ descriptor.label, max_ui_windows }),
+                    3 => ui_app_log.warn("declared window '{s}' ignored: window and canvas labels must be non-empty and fit the platform label budgets", .{descriptor.label}),
+                    4 => ui_app_log.warn("declared window '{s}' ignored: canvas label '{s}' is already bound - every window's canvas label must be unique", .{ descriptor.label, descriptor.canvas_label }),
+                    else => unreachable,
+                }
             }
         }
 
@@ -2881,6 +3211,12 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 return;
             }
 
+            self.openWindowSlot(runtime, descriptor);
+        }
+
+        /// Native capability boundary: create the shell, then retain its
+        /// labels, close message, tree arenas and GPU state only on success.
+        fn openWindowSlot(self: *Self, runtime: *Runtime, descriptor: WindowDescriptor) void {
             const shell_views = [_]app_manifest.ShellView{self.secondaryShellView(descriptor)};
             const info = runtime.createSourcelessShellWindow(.{
                 .label = descriptor.label,
@@ -3047,7 +3383,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             // exactly like the main window's, so a proven collision
             // stamps the cluster into THIS slot's tokens (a local copy —
             // other windows keep their own layout) for one more pass.
-            if (windowControlsReservation(runtime, slot.window_id, slot.canvasLabel(), built.layout, tokens)) |controls| {
+            if (try windowControlsReservation(runtime, slot.window_id, slot.canvasLabel(), built.layout, tokens)) |controls| {
                 tokens.window_controls = controls;
                 built = try self.buildWindowSlotPass(slot, bounds, tokens, next_index);
             }
@@ -3075,7 +3411,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 runtime.recordDispatchError("hover_leave_capture", refresh_err);
             }
             // Same close-on-vanish rule as the main canvas rebuild.
-            if (self.contextMenuFallbackTargetForLabel(slot.canvasLabel()) != 0 and tree.context_menu_fallback == null) {
+            if (self.componentDecision(.fallback_vanished, self.contextMenuFallbackTargetForLabel(slot.canvasLabel()) != 0, tree.context_menu_fallback != null, false) != 0) {
                 self.clearContextMenuFallback();
             }
             // Reconcile the video declaration THIS build recorded or
@@ -3170,6 +3506,11 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             std.debug.assert(if (self.context_menu_pin) |pin| pin.window_id != slot.window_id or pin.arena_index != next_index else true);
             _ = slot.arenas[next_index].reset(.retain_capacity);
             var ui = Ui.init(slot.arenas[next_index].allocator());
+            ui.composition_policy = self.options.composition_policy;
+            ui.code_content_policy = self.options.code_content_policy;
+            ui.chart_content_policy = self.options.chart_content_policy;
+            ui.markdown_content_policy = self.options.markdown_content_policy;
+            ui.construction_policy = self.options.construction_policy;
             // Window views render the same honest video chrome state,
             // and their `<video src>` declarations reconcile the channel
             // too — `Ui.video` promises that declaring the element IS
@@ -3182,6 +3523,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             // key, whichever tree binds it.
             self.terminal_sessions.beginBuild(tokens);
             ui.terminal_lookup = self.terminal_sessions.lookup();
+            ui.pty_key_resolver = self.options.pty_key_resolver;
             ui.context_menu_fallback_target = self.contextMenuFallbackTargetForLabel(slot.canvasLabel());
             if (ui.context_menu_fallback_target != 0) ui.context_menu_fallback_point = self.context_menu_fallback_point;
             self.armUiFragmentHost(&ui);
@@ -3308,21 +3650,37 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// runtime then regenerates the widget span on internal state
         /// changes while preserving the chrome via
         /// `emitCanvasWidgetDisplayListWithChrome`.
+        // Zig-core compatibility for the original combined chrome callback.
+        // Compiled cores always install the TypeScript composition owner.
+        fn nativeChromePlan(chrome: ChromeOptions, count: usize, before: ?usize) error{InvalidChromeCommandCount}!canvas.render_coordination_policy.ChromePlan {
+            const prefix = before orelse blk: {
+                if (count < chrome.suffix_commands) return error.InvalidChromeCommandCount;
+                break :blk count - chrome.suffix_commands;
+            };
+            if (prefix > count or (chrome.variable_prefix and prefix > chrome.prefix_commands) or
+                (!chrome.variable_prefix and prefix != chrome.prefix_commands)) return error.InvalidChromeCommandCount;
+            const suffix = count - prefix;
+            if (before != null and suffix > chrome.suffix_commands) return error.InvalidChromeCommandCount;
+            return .{ .prefix = prefix, .suffix = suffix };
+        }
+
         fn installChromeDisplayList(self: *Self, runtime: *Runtime, window_id: platform.WindowId, chrome: ChromeOptions, layout: canvas.WidgetLayoutTree, tokens: canvas.DesignTokens) anyerror!void {
             var chrome_commands: [canvas_limits.max_canvas_commands_per_view]canvas.CanvasCommand = undefined;
             var chrome_builder = canvas.Builder.init(&chrome_commands);
             try chrome.build(&self.model, &chrome_builder, self.canvas_size, tokens);
-            const chrome_list = chrome_builder.displayList();
-            if (chrome.variable_prefix) {
-                if (chrome_list.commands.len < chrome.suffix_commands or
-                    chrome_list.commands.len - chrome.suffix_commands > chrome.prefix_commands)
-                {
-                    return error.InvalidChromeCommandCount;
-                }
-            } else if (chrome_list.commands.len != chrome.prefix_commands + chrome.suffix_commands) {
-                return error.InvalidChromeCommandCount;
+            var before_suffix: ?usize = null;
+            if (chrome.build_suffix) |build_suffix| {
+                before_suffix = chrome_builder.displayList().commands.len;
+                try build_suffix(&self.model, &chrome_builder, self.canvas_size, tokens);
             }
-            const prefix_len = chrome_list.commands.len - chrome.suffix_commands;
+            const count = chrome_builder.displayList().commands.len;
+            const plan = if (self.options.render_coordination_policy) |policy|
+                try canvas.render_coordination_policy.ChromePlan.init(policy, chrome.prefix_commands, chrome.suffix_commands, count, before_suffix, chrome.variable_prefix)
+            else
+                try nativeChromePlan(chrome, count, before_suffix);
+            const prefix_len = plan.prefix;
+            const suffix_len = plan.suffix;
+            const chrome_list = chrome_builder.displayList();
 
             var commands: [canvas_limits.max_canvas_commands_per_view]canvas.CanvasCommand = undefined;
             var builder = canvas.Builder.init(&commands);
@@ -3338,7 +3696,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             try self.publishWidgetLayoutTracked(runtime, window_id, self.options.canvas_label, layout, &self.main_tree_current);
             _ = try runtime.emitCanvasWidgetDisplayListWithChrome(window_id, self.options.canvas_label, tokens, .{
                 .prefix_command_count = prefix_len,
-                .suffix_command_count = chrome.suffix_commands,
+                .suffix_command_count = suffix_len,
             });
         }
 
@@ -3407,6 +3765,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             const sources: []const canvas.ui_markup.SourceFile = if (self.options.markup) |markup_options| markup_options.sources else &.{};
             var set_loader = canvas.ui_markup.SourceSetLoader{ .set = sources };
             var hashing = HashingLoader.init(set_loader.loader(), source, "");
+            hashing.policy = self.options.markup_development_policy;
             if (comptime features.runtime_markup) {
                 self.provenance_closure.reset();
                 hashing.closure = &self.provenance_closure;
@@ -3417,17 +3776,43 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             const owned_source = try arena.dupe(u8, source);
             var diagnostic: canvas.ui_markup.MarkupErrorInfo = .{};
             const document = canvas.ui_markup.resolveImports(arena, "", owned_source, hashing.loader(), &diagnostic) catch |err| {
-                if (err == error.MarkupSyntax or err == error.MarkupImport) self.recordMarkupDiagnostic(diagnostic);
+                if (self.options.markup_development_policy) |callback| {
+                    const program = markup_development.reload(callback, 0, true, true, err == error.MarkupSyntax or err == error.MarkupImport, false, self.installed);
+                    for (program) |byte| switch (@as(markup_development.Action, @enumFromInt(byte))) {
+                        .end => break,
+                        .diagnostic => self.recordMarkupDiagnostic(diagnostic),
+                        else => unreachable,
+                    };
+                } else if (err == error.MarkupSyntax or err == error.MarkupImport) self.recordMarkupDiagnostic(diagnostic);
                 return err;
             };
             // The typed-document pass: attribute expressions parse once
             // here instead of on every frame's build.
+            if (self.options.markup_development_policy) |callback| {
+                try self.applyRootMarkupProgram(callback, 0, document, arena, next_index, hashing.hasher.final(), "", owned_source, null, 0);
+                return;
+            }
             const canonical = try canvas.ui_markup.canonicalize(arena, document);
             self.adoptMarkupDocument(canonical, next_index, hashing.hasher.final());
             // Embedded resolve: root nodes carry an empty src_path, and
             // imported entries are markup-root-relative (joined onto the
             // watched file's directory for their on-disk location).
             self.commitProvenanceFiles("", owned_source, false);
+        }
+
+        fn applyRootMarkupProgram(self: *Self, callback: *const fn ([]const u8, []u8) usize, kind: u8, document: canvas.ui_markup.MarkupDocument, arena: std.mem.Allocator, next_index: usize, hash: u64, path: []const u8, source: []const u8, runtime: ?*Runtime, window_id: platform.WindowId) anyerror!void {
+            const program = markup_development.reload(callback, kind, kind == 0 or hash != self.markup_source_hash, false, false, false, self.installed);
+            var canonical = document;
+            for (program) |byte| switch (@as(markup_development.Action, @enumFromInt(byte))) {
+                .end => break,
+                .canonicalize => canonical = if (kind == 0) try canvas.ui_markup.canonicalize(arena, document) else canvas.ui_markup.canonicalize(arena, document) catch document,
+                .adopt_root => self.adoptMarkupDocument(canonical, next_index, hash),
+                .provenance => self.commitProvenanceFiles(path, source, kind == 1),
+                .rebuild_root => if (runtime) |value| {
+                    self.rebuild(value, window_id) catch {};
+                },
+                else => unreachable,
+            };
         }
 
         /// Activate a resolved document built into `arena_index`'s arena.
@@ -3454,6 +3839,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             /// resolver-relative path and content hash is recorded so the
             /// adopt step can commit them as write-back anchors.
             closure: ?*ui_app_provenance.ClosureFiles = null,
+            policy: markup_development.Policy = null,
 
             fn init(inner: canvas.ui_markup.ImportLoader, root_source: []const u8, strip_prefix: []const u8) HashingLoader {
                 var hasher = std.hash.Wyhash.init(0);
@@ -3469,7 +3855,9 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 const self: *HashingLoader = @ptrCast(@alignCast(@constCast(context)));
                 const source = self.inner.load(self.inner.context, arena, path) orelse return null;
                 var hashed_path = path;
-                if (self.strip_prefix.len > 0 and path.len > self.strip_prefix.len and
+                if (self.policy) |callback| {
+                    hashed_path = markup_development.stripPrefix(callback, self.strip_prefix, path);
+                } else if (self.strip_prefix.len > 0 and path.len > self.strip_prefix.len and
                     std.mem.startsWith(u8, path, self.strip_prefix) and path[self.strip_prefix.len] == '/')
                 {
                     hashed_path = path[self.strip_prefix.len + 1 ..];
@@ -3501,7 +3889,16 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             for (self.provenance_closure.entries[0..self.provenance_closure.len]) |*entry| {
                 const stamped = entry.path[0..entry.path_len];
                 var disk_buffer: [ui_app_provenance.max_path_bytes]u8 = undefined;
-                const disk: []const u8 = if (entries_are_disk_paths)
+                const disk: []const u8 = if (self.options.markup_development_policy) |callback| blk: {
+                    var input: [2 * ui_app_provenance.max_path_bytes + 16]u8 = undefined;
+                    var writer = std.Io.Writer.fixed(&input);
+                    const r = markup_development.Request.begin(&writer, 10) catch unreachable;
+                    r.byte(@intFromBool(entries_are_disk_paths)) catch unreachable;
+                    r.byte(@intFromBool(watch_path != null)) catch unreachable;
+                    r.blob(disk_prefix[0..@min(disk_prefix.len, ui_app_provenance.max_path_bytes + 1)]) catch unreachable;
+                    r.blob(stamped) catch unreachable;
+                    break :blk markup_development.evaluate(callback, writer.buffered(), &disk_buffer);
+                } else if (entries_are_disk_paths)
                     stamped
                 else if (watch_path == null)
                     ""
@@ -3536,12 +3933,37 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// sites) and the arena resets on the next reload attempt, so the
         /// stored copy owns its bytes.
         fn recordMarkupDiagnostic(self: *Self, info: canvas.ui_markup.MarkupErrorInfo) void {
-            const already_reported = if (self.markup_diagnostic) |current|
-                current.line == info.line and current.column == info.column and
-                    std.mem.eql(u8, current.message, info.message) and std.mem.eql(u8, current.path, info.path)
-            else
-                false;
-            if (!already_reported) {
+            var should_report: bool = undefined;
+            var message_len: usize = @min(info.message.len, self.markup_diagnostic_message_storage.len);
+            var path_len: usize = @min(info.path.len, self.markup_diagnostic_path_storage.len);
+            if (self.options.markup_development_policy) |callback| {
+                var input: [8192]u8 = undefined;
+                var writer = std.Io.Writer.fixed(&input);
+                const r = markup_development.Request.begin(&writer, 2) catch unreachable;
+                const current = self.markup_diagnostic;
+                r.byte(@intFromBool(current != null)) catch unreachable;
+                r.byte(@intFromBool(if (current) |value| value.line == info.line else false)) catch unreachable;
+                r.byte(@intFromBool(if (current) |value| value.column == info.column else false)) catch unreachable;
+                r.blob(if (current) |value| value.message else "") catch unreachable;
+                r.blob(info.message[0..@min(info.message.len, self.markup_diagnostic_message_storage.len + 1)]) catch unreachable;
+                r.blob(if (current) |value| value.path else "") catch unreachable;
+                r.blob(info.path[0..@min(info.path.len, self.markup_diagnostic_path_storage.len + 1)]) catch unreachable;
+                r.word(self.markup_diagnostic_message_storage.len) catch unreachable;
+                r.word(self.markup_diagnostic_path_storage.len) catch unreachable;
+                var output: [12]u8 = undefined;
+                const result = markup_development.evaluate(callback, writer.buffered(), &output);
+                if (result.len != 12 or markup_development.word(result, 0) > 1 or markup_development.word(result, 4) > message_len or markup_development.word(result, 8) > path_len) @panic("invalid markup diagnostic extent");
+                should_report = markup_development.word(result, 0) != 0;
+                message_len = markup_development.word(result, 4);
+                path_len = markup_development.word(result, 8);
+            } else {
+                should_report = if (self.markup_diagnostic) |current|
+                    !(current.line == info.line and current.column == info.column and
+                        std.mem.eql(u8, current.message, info.message) and std.mem.eql(u8, current.path, info.path))
+                else
+                    true;
+            }
+            if (should_report) {
                 // std.debug.print, not std.log: the default scaffold app is
                 // ReleaseFast (std.log only passes .err there), while
                 // logged errors fail test suites that exercise bad markup
@@ -3552,9 +3974,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                     std.debug.print("markup view failed to build ({d}:{d}): {s}\n", .{ info.line, info.column, info.message });
                 }
             }
-            const message_len = @min(info.message.len, self.markup_diagnostic_message_storage.len);
             @memcpy(self.markup_diagnostic_message_storage[0..message_len], info.message[0..message_len]);
-            const path_len = @min(info.path.len, self.markup_diagnostic_path_storage.len);
             @memcpy(self.markup_diagnostic_path_storage[0..path_len], info.path[0..path_len]);
             self.markup_diagnostic = .{
                 .line = info.line,
@@ -3574,7 +3994,9 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 markup_options.watch_path != null and markup_options.io != null
             else
                 false;
-            if (root_armed) {
+            const count = if (comptime fragment_watch_enabled) (if (self.options.fragment_watch) |watch| watch.fragments.len else 0) else 0;
+            const plan = if (self.options.markup_development_policy) |callback| markup_development.watch(callback, root_armed, self.options.view != null, self.markup_source_hash == 0, fragment_watch_enabled and self.options.fragment_watch != null, count, max_watched_fragments) else null;
+            if (if (plan) |value| value[0] != 0 else root_armed and self.options.view != null and self.markup_source_hash == 0) {
                 const markup_options = self.options.markup.?;
                 // With a compiled `view` also set, the embedded sources are
                 // the baseline: the interpreter only takes over once the
@@ -3582,12 +4004,10 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 // be computed the way the poll computes it — over the whole
                 // resolved import closure — or the first poll would flag a
                 // phantom change.
-                if (self.options.view != null and self.markup_source_hash == 0) {
-                    self.markup_source_hash = self.embeddedMarkupClosureHash(markup_options);
-                }
+                self.markup_source_hash = self.embeddedMarkupClosureHash(markup_options);
             }
             const fragments_armed = self.armFragmentWatch();
-            if (!root_armed and !fragments_armed) return;
+            if (if (plan) |value| value[1] == 0 else !root_armed and !fragments_armed) return;
             runtime.startTimer(markup_watch_timer_id, markup_watch_interval_ns, true) catch {};
             // Make the armed watch observable: the automation snapshot
             // header reports `markup_watch=armed|off`, so a dev loop can
@@ -3608,19 +4028,20 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         fn armFragmentWatch(self: *Self) bool {
             if (comptime !fragment_watch_enabled) return false;
             const fragment_watch = self.options.fragment_watch orelse return false;
-            if (fragment_watch.fragments.len > max_watched_fragments) {
+            const plan = if (self.options.markup_development_policy) |callback| markup_development.watch(callback, false, false, false, true, fragment_watch.fragments.len, max_watched_fragments) else null;
+            if (if (plan) |value| value[3] != 0 else fragment_watch.fragments.len > max_watched_fragments) {
                 ui_app_log.warn(
                     "fragment watch: {d} fragments registered but the watch budget is {d} (max_watched_fragments) - the rest stay compiled-only; consolidate fragments or raise the budget",
                     .{ fragment_watch.fragments.len, max_watched_fragments },
                 );
             }
-            const count = @min(fragment_watch.fragments.len, max_watched_fragments);
+            const count: usize = if (plan) |value| value[2] else @min(fragment_watch.fragments.len, max_watched_fragments);
             for (fragment_watch.fragments[0..count], self.markup_fragment_slots[0..count]) |spec, *slot| {
                 // Baseline into the slot's inactive arena — reset on the
                 // next reload attempt, so this costs nothing durable.
                 const scratch_index = slot.arena_index ^ 1;
                 _ = slot.arenas[scratch_index].reset(.retain_capacity);
-                slot.baseline_hash = embeddedClosureHash(slot.arenas[scratch_index].allocator(), spec.source, spec.sources);
+                slot.baseline_hash = embeddedClosureHash(slot.arenas[scratch_index].allocator(), spec.source, spec.sources, self.options.markup_development_policy);
                 slot.hash = slot.baseline_hash;
             }
             return count > 0;
@@ -3631,18 +4052,19 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             // hashing side effect; the arena resets on the next reload.
             const scratch_index = self.markup_arena_index ^ 1;
             _ = self.markup_arenas[scratch_index].reset(.retain_capacity);
-            return embeddedClosureHash(self.markup_arenas[scratch_index].allocator(), markup_options.source, markup_options.sources);
+            return embeddedClosureHash(self.markup_arenas[scratch_index].allocator(), markup_options.source, markup_options.sources, self.options.markup_development_policy);
         }
 
         /// Hash an embedded source closure exactly like the disk poll
         /// hashes the on-disk one: root bytes plus every loaded file's
         /// root-relative path and bytes, in resolution order.
-        fn embeddedClosureHash(arena: std.mem.Allocator, source: []const u8, sources: []const canvas.ui_markup.SourceFile) u64 {
+        fn embeddedClosureHash(arena: std.mem.Allocator, source: []const u8, sources: []const canvas.ui_markup.SourceFile, policy: markup_development.Policy) u64 {
             if (sources.len == 0) {
                 return std.hash.Wyhash.hash(0, source);
             }
             var set_loader = canvas.ui_markup.SourceSetLoader{ .set = sources };
             var hashing = HashingLoader.init(set_loader.loader(), source, "");
+            hashing.policy = policy;
             var diagnostic: canvas.ui_markup.MarkupErrorInfo = .{};
             _ = canvas.ui_markup.resolveImports(
                 arena,
@@ -3673,6 +4095,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             var disk_loader = DiskImportLoader{ .io = io };
             const watch_dir = std.fs.path.dirname(watch_path) orelse "";
             var hashing = HashingLoader.init(disk_loader.loader(), source, watch_dir);
+            hashing.policy = self.options.markup_development_policy;
             if (comptime features.runtime_markup) {
                 self.provenance_closure.reset();
                 hashing.closure = &self.provenance_closure;
@@ -3680,6 +4103,16 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             var diagnostic: canvas.ui_markup.MarkupErrorInfo = .{};
             const document = canvas.ui_markup.resolveImports(arena, watch_path, source, hashing.loader(), &diagnostic) catch |err| {
                 const hash = hashing.hasher.final();
+                if (self.options.markup_development_policy) |callback| {
+                    const program = markup_development.reload(callback, 1, hash != self.markup_source_hash, true, err == error.MarkupSyntax or err == error.MarkupImport, false, self.installed);
+                    for (program) |byte| switch (@as(markup_development.Action, @enumFromInt(byte))) {
+                        .end => break,
+                        .observed_hash => self.markup_source_hash = hash,
+                        .diagnostic => self.recordMarkupDiagnostic(diagnostic),
+                        else => unreachable,
+                    };
+                    return;
+                }
                 if (hash == self.markup_source_hash) return;
                 self.markup_source_hash = hash;
                 if (err == error.MarkupSyntax or err == error.MarkupImport) {
@@ -3688,6 +4121,10 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 return;
             };
             const hash = hashing.hasher.final();
+            if (self.options.markup_development_policy) |callback| {
+                self.applyRootMarkupProgram(callback, 1, document, arena, next_index, hash, watch_path, source, runtime, window_id) catch {};
+                return;
+            }
             if (hash == self.markup_source_hash) return;
             // Canonicalize for per-frame cost only; on OOM the raw
             // document builds identically through attrTyped's fallback.
@@ -3721,9 +4158,20 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 var disk_loader = DiskImportLoader{ .io = fragment_watch.io };
                 const watch_dir = std.fs.path.dirname(spec.path) orelse "";
                 var hashing = HashingLoader.init(disk_loader.loader(), source, watch_dir);
+                hashing.policy = self.options.markup_development_policy;
                 var diagnostic: canvas.ui_markup.MarkupErrorInfo = .{};
                 const document = canvas.ui_markup.resolveImports(arena, spec.path, source, hashing.loader(), &diagnostic) catch |err| {
                     const hash = hashing.hasher.final();
+                    if (self.options.markup_development_policy) |callback| {
+                        const program = markup_development.reload(callback, 2, hash != slot.hash, true, err == error.MarkupSyntax or err == error.MarkupImport, false, self.installed);
+                        for (program) |byte| switch (@as(markup_development.Action, @enumFromInt(byte))) {
+                            .end => break,
+                            .observed_hash => slot.hash = hash,
+                            .diagnostic => self.recordMarkupDiagnostic(diagnostic),
+                            else => unreachable,
+                        };
+                        continue;
+                    }
                     if (hash == slot.hash) continue;
                     slot.hash = hash;
                     if (err == error.MarkupSyntax or err == error.MarkupImport) {
@@ -3732,6 +4180,22 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                     continue;
                 };
                 const hash = hashing.hasher.final();
+                if (self.options.markup_development_policy) |callback| {
+                    const program = markup_development.reload(callback, 2, hash != slot.hash, false, false, hash == slot.baseline_hash, self.installed);
+                    var canonical = document;
+                    for (program) |byte| switch (@as(markup_development.Action, @enumFromInt(byte))) {
+                        .end => break,
+                        .observed_hash => slot.hash = hash,
+                        .canonicalize => canonical = canvas.ui_markup.canonicalize(arena, document) catch document,
+                        .restore_fragment => slot.document = null,
+                        .adopt_fragment => slot.document = canonical,
+                        .switch_arena => slot.arena_index = next_index,
+                        .clear_diagnostic => self.markup_diagnostic = null,
+                        .adopted_fragment => any_adopted = true,
+                        else => unreachable,
+                    };
+                    continue;
+                }
                 if (hash == slot.hash) continue;
                 slot.hash = hash;
                 if (hash == slot.baseline_hash) {
@@ -3755,7 +4219,14 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             // Fragments build wherever the app's views embed them — the
             // main canvas and declared windows — so a reload re-derives
             // every open view.
-            if (any_adopted and self.installed) self.rebuildAllViews(runtime) catch {};
+            const should_rebuild = if (self.options.markup_development_policy) |callback| blk: {
+                const input = [_]u8{ 32, 1, 11, 0, @intFromBool(any_adopted), @intFromBool(self.installed) };
+                var output: [4]u8 = undefined;
+                const result = markup_development.evaluate(callback, &input, &output);
+                if (result.len != 4 or markup_development.word(result, 0) > 1) @panic("invalid markup rebuild result");
+                break :blk markup_development.word(result, 0) != 0;
+            } else any_adopted and self.installed;
+            if (should_rebuild) self.rebuildAllViews(runtime) catch {};
         }
 
         /// The `override` half of the fragment hot-reload seam (see
@@ -3902,14 +4373,50 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             return self.status_items_scratch.status_items[0..1];
         }
 
+        fn statusItemPolicyDecision(self: *Self, desired: []const StatusItemDescriptor, index: ?usize) [2]u8 {
+            comptime std.debug.assert(platform.max_status_items == 8);
+            var request: [4 + 8 * 4 + 8 * 5]u8 = undefined;
+            request[0] = @intFromBool(index != null);
+            request[1] = if (index) |i| @intCast(i) else 255;
+            request[2] = @intCast(desired.len);
+            request[3] = @intCast(self.applied_status_item_count);
+            var at: usize = 4;
+            for (desired) |descriptor| {
+                std.mem.writeInt(u32, request[at..][0..4], descriptor.id, .little);
+                at += 4;
+            }
+            for (self.applied_status_items) |applied| {
+                request[at] = @intFromBool(applied.active);
+                std.mem.writeInt(u32, request[at + 1 ..][0..4], applied.id, .little);
+                at += 5;
+            }
+            var result: [2]u8 = undefined;
+            if (self.options.status_policy.?(request[0..at], &result) != result.len) @panic("invalid compiled status policy result");
+            if (index != null and (result[0] > 3 or (result[0] >= 2 and result[1] >= platform.max_status_items))) @panic("invalid compiled status admission");
+            return result;
+        }
+
+        fn statusItemPatchDecision(self: *Self, applied: *const AppliedStatusItem, shell: u64, presentation: u64, menu: u64) u8 {
+            var request: [49]u8 = undefined;
+            request[0] = 2;
+            const hashes = [_]u64{ shell, presentation, menu, applied.shell_hash, applied.presentation_hash, applied.menu_hash };
+            for (hashes, 0..) |hash, index| std.mem.writeInt(u64, request[1 + index * 8 ..][0..8], hash, .little);
+            var result: [2]u8 = undefined;
+            if (self.options.status_policy.?(&request, &result) != result.len or result[0] > 7) @panic("invalid compiled status patch result");
+            return result[0];
+        }
+
         fn reconcileStatusItems(self: *Self, runtime: *Runtime, declared: []const StatusItemDescriptor) void {
             if (declared.len > platform.max_status_items) {
                 ui_app_log.warn("status item collection has {d} entries; at most {d} are supported", .{ declared.len, platform.max_status_items });
             }
             const desired = declared[0..@min(declared.len, platform.max_status_items)];
 
-            for (&self.applied_status_items) |*applied| {
-                if (!applied.active or statusItemDeclared(desired, applied.id)) continue;
+            const compiled = self.options.status_policy != null;
+            const retirement = if (compiled) self.statusItemPolicyDecision(desired, null)[0] else 0;
+            for (&self.applied_status_items, 0..) |*applied, slot| {
+                const remove = if (compiled) retirement & (@as(u8, 1) << @intCast(slot)) != 0 else applied.active and !statusItemDeclared(desired, applied.id);
+                if (!remove) continue;
                 runtime.removeStatusItem(applied.id) catch |err| {
                     ui_app_log.warn("status item #{d} remove failed: {s}", .{ applied.id, @errorName(err) });
                     continue;
@@ -3919,8 +4426,16 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             }
 
             for (desired, 0..) |raw_descriptor, index| {
-                if (raw_descriptor.id == 0 or statusItemIdAppearedEarlier(desired, index, raw_descriptor.id)) {
+                // Requery the owned table after every successful or failed OS
+                // operation. Failed removals retain slots; failed creates do not.
+                const plan = if (compiled) self.statusItemPolicyDecision(desired, index) else [2]u8{ 0, 255 };
+                const invalid = if (compiled) plan[0] == 0 else raw_descriptor.id == 0 or statusItemIdAppearedEarlier(desired, index, raw_descriptor.id);
+                if (invalid) {
                     ui_app_log.warn("status item declaration ignored: identifiers must be unique and non-zero (got {d})", .{raw_descriptor.id});
+                    continue;
+                }
+                if (compiled and plan[0] == 1) {
+                    ui_app_log.warn("status item #{d} ignored: status-item capacity is full", .{raw_descriptor.id});
                     continue;
                 }
                 var descriptor = raw_descriptor;
@@ -3937,11 +4452,12 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 const presentation_hash = hashTrayPresentation(descriptor.state.presentation);
                 const menu_hash = hashTrayMenu(descriptor.state.items);
 
-                const applied = self.findAppliedStatusItem(descriptor.id) orelse self.emptyAppliedStatusItem() orelse {
+                const applied = if (compiled) &self.applied_status_items[plan[1]] else self.findAppliedStatusItem(descriptor.id) orelse self.emptyAppliedStatusItem() orelse {
                     ui_app_log.warn("status item #{d} ignored: status-item capacity is full", .{descriptor.id});
                     continue;
                 };
-                if (!applied.active) {
+                const creating = if (compiled) plan[0] == 2 else !applied.active;
+                if (creating) {
                     runtime.createStatusItem(descriptor.id, .{
                         .title = descriptor.state.presentation.title,
                         .icon_path = shell.icon_path,
@@ -3967,7 +4483,10 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                     continue;
                 }
 
-                if (shell_hash != applied.shell_hash) {
+                const changes = if (compiled) self.statusItemPatchDecision(applied, shell_hash, presentation_hash, menu_hash) else @as(u8, @intFromBool(shell_hash != applied.shell_hash)) |
+                    (@as(u8, @intFromBool(presentation_hash != applied.presentation_hash)) << 1) |
+                    (@as(u8, @intFromBool(menu_hash != applied.menu_hash)) << 2);
+                if (changes & 1 != 0) {
                     applied.shell_hash = shell_hash;
                     if (!applied.shell_unsupported) {
                         runtime.updateStatusItemShell(descriptor.id, shell) catch |err| {
@@ -3976,7 +4495,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                         };
                     }
                 }
-                if (presentation_hash != applied.presentation_hash) {
+                if (changes & 2 != 0) {
                     applied.presentation_hash = presentation_hash;
                     if (!applied.presentation_unsupported) {
                         runtime.updateStatusItemPresentation(descriptor.id, descriptor.state.presentation) catch |err| {
@@ -3985,7 +4504,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                         };
                     }
                 }
-                if (menu_hash != applied.menu_hash) {
+                if (changes & 4 != 0) {
                     applied.menu_hash = menu_hash;
                     runtime.updateStatusItemMenu(descriptor.id, descriptor.state.items) catch |err| {
                         ui_app_log.warn("status item #{d} menu update failed: {s}", .{ descriptor.id, @errorName(err) });
@@ -4247,65 +4766,45 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
 
         fn eventFn(context: *anyopaque, runtime: *Runtime, event_value: Event) anyerror!void {
             const self: *Self = @ptrCast(@alignCast(context));
+            if (self.options.on_window_context) |map| {
+                const source_id: ?platform.WindowId = switch (event_value) {
+                    inline .command, .shortcut, .canvas_widget_pointer, .canvas_widget_keyboard, .canvas_widget_scroll, .canvas_widget_file_drop, .canvas_widget_drag, .canvas_widget_context_menu, .canvas_widget_context_menu_shown, .canvas_widget_context_menu_dismissed, .canvas_widget_context_menu_request, .canvas_widget_dismiss, .canvas_widget_context_press, .canvas_widget_resize, .canvas_widget_change, .window_closed, .automation_provenance => |event| event.window_id,
+                    else => null,
+                };
+                if (source_id) |id| {
+                    var storage: [platform.max_windows]platform.WindowInfo = undefined;
+                    for (runtime.listWindows(&storage)) |window| {
+                        if (window.id != id) continue;
+                        if (map(&self.model, window.label)) |msg| self.applyMsg(msg);
+                        break;
+                    }
+                }
+            }
             self.hover_msg_event_depth += 1;
             defer self.hover_msg_event_depth -= 1;
-            // Hover enter/leave delivery rides the tail of runtime
-            // events: the standing chain moves during pointer routing,
-            // scroll reconciles (wheel, kinetic, drivers, keyboard),
-            // dismissals, and any rebuild the dispatches above
-            // performed — the drain seam catches them all, and replay
-            // re-runs the same events through the same seam. The drain
-            // runs on the handler's ERROR path too (the degraded-error
-            // doctrine): a failing handler must not strand edges the
-            // event already produced — a closed window's leave, a
-            // failed rebuild's prune — until some later event happens
-            // by. Mid-cycle DERIVED widget events skip the drain (see
-            // `hoverDrainsAfterEvent`): their input cycle's terminal
-            // `gpu_surface_input` dispatch drains after the cycle's
-            // pending scroll/resize/change observations were delivered,
-            // so a hover Msg's rebuild can never unmount a view whose
-            // promised observation is still queued.
+            var first_error: ?anyerror = null;
             handleRuntimeEvent(self, runtime, event_value) catch |err| {
-                if (hoverDrainsAfterEvent(event_value)) self.drainHoverMsgs(runtime) catch {};
-                return err;
+                first_error = err;
             };
-            if (hoverDrainsAfterEvent(event_value)) try self.drainHoverMsgs(runtime);
-        }
-
-        /// Whether the hover drain runs at this event's tail. Derived
-        /// widget events that only occur INSIDE a gpu-surface input
-        /// cycle defer to the cycle's terminal `gpu_surface_input`
-        /// dispatch — which always follows them, after the pending
-        /// scroll/resize/change drains. Scroll/resize/change events also
-        /// arrive standalone from the native-driver and kinetic paths;
-        /// those defer at most one frame (both paths run under an
-        /// actively pumping frame channel), which is the price of never
-        /// rebuilding mid-cycle. Dismiss events DO drain: the
-        /// automation/accessibility dismiss verb dispatches one
-        /// standalone, and a dismissal's own Msg rebuild already runs
-        /// before the cycle's pending drains, so draining here adds no
-        /// new hazard class. Everything else — commands, timers, wakes,
-        /// frames, the terminal input dispatch, native menu selections —
-        /// drains immediately.
-        fn hoverDrainsAfterEvent(event_value: Event) bool {
-            return switch (event_value) {
-                // Keyboard events usually ride an input cycle (their
-                // terminal dispatch drains); the standalone ones —
-                // accessibility selection edits, context-menu
-                // cut/paste/select-all — have no cycle and drain here.
-                .canvas_widget_keyboard => |keyboard_event| keyboard_event.standalone,
-                .canvas_widget_pointer,
-                .canvas_widget_drag,
-                .canvas_widget_file_drop,
-                .canvas_widget_context_press,
-                .canvas_widget_context_menu_request,
-                .canvas_widget_context_menu_shown,
-                .canvas_widget_scroll,
-                .canvas_widget_resize,
-                .canvas_widget_change,
-                => false,
-                else => true,
+            // Event classification describes the native input envelope; the
+            // portable policy chooses settlement, including error paths.
+            const kind: u8 = switch (event_value) {
+                .canvas_widget_keyboard => 2,
+                .canvas_widget_pointer, .canvas_widget_drag, .canvas_widget_file_drop, .canvas_widget_context_press, .canvas_widget_context_menu_request, .canvas_widget_context_menu_shown, .canvas_widget_scroll, .canvas_widget_resize, .canvas_widget_change => 1,
+                else => 0,
             };
+            const standalone = switch (event_value) {
+                .canvas_widget_keyboard => |keyboard| keyboard.standalone,
+                else => false,
+            };
+            const tail = dispatch_policy.plan(self.options.app_dispatch_policy, .event_tail, kind, @intFromBool(standalone));
+            for (tail) |byte| switch (@as(dispatch_policy.Action, @enumFromInt(byte))) {
+                .end => break,
+                .hover => self.drainHoverMsgs(runtime) catch |err| self.selectDispatchError(&first_error, err),
+                else => @panic("unexpected event tail action"),
+            };
+            if (self.hover_msg_event_depth == 1) self.effects.flushDesktopCapabilities();
+            if (first_error) |err| return err;
         }
 
         fn handleRuntimeEvent(self: *Self, runtime: *Runtime, event_value: Event) anyerror!void {
@@ -4502,9 +5001,15 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                             .{ font.name, canvas.min_registered_font_id },
                         ),
                         error.ReservedFontId => ui_app_log.warn(
-                            "font \"{s}\" (id {d}) failed to register: ids below {d} are reserved for built-in faces; choose an id at or above {d} (canvas.min_registered_font_id)",
-                            .{ font.name, font.id, canvas.min_registered_font_id, canvas.min_registered_font_id },
+                            "font \"{s}\" (id {d}) failed to register: ids below {d} are reserved for built-in faces; choose an id at or above {d} (canvas.min_registered_font_id), or one of the sans variant ids {d}-{d} to supply your own weight or slant",
+                            .{ font.name, font.id, canvas.min_registered_font_id, canvas.min_registered_font_id, canvas.default_sans_medium_font_id, canvas.default_sans_bold_italic_font_id },
                         ),
+                        // BEGIN sans-variant-registration patch (zig-nostr/native)
+                        error.FontRegistrationTooLate => ui_app_log.warn(
+                            "font \"{s}\" (id {d}) failed to register: the sans variant ids can only be filled before the first frame is planned",
+                            .{ font.name, font.id },
+                        ),
+                        // END sans-variant-registration patch
                         error.FontIdInUse => ui_app_log.warn(
                             "font \"{s}\" (id {d}) failed to register: that id already holds a registered face, and registered ids are permanent (atlas caches key glyphs by font id) — give each face its own id",
                             .{ font.name, font.id },
@@ -4524,15 +5029,19 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         }
 
         fn handleFrame(self: *Self, runtime: *Runtime, frame_event: platform.GpuSurfaceFrameEvent) anyerror!void {
+            // A secondary surface can be the only surviving frame source.
+            try self.drainEffects(runtime);
+            for (runtime.windows[0..runtime.window_count]) |window| {
+                if (window.info.id == frame_event.window_id and !window.info.open) return;
+            }
             if (!std.mem.eql(u8, frame_event.label, self.options.canvas_label)) {
                 return self.handleWindowSlotFrame(runtime, frame_event);
             }
             // Host-pumped embeds deliver no `.wake`; drain pending effect
             // results with the frame tick so this frame presents them.
-            try self.drainEffects(runtime);
             self.canvas_window_id = frame_event.window_id;
             self.frame_timestamp_ns = frame_event.timestamp_ns;
-            const scale = normalizedSurfaceScale(frame_event.scale_factor);
+            const scale = self.normalizedSurfaceScale(frame_event.scale_factor);
             var installing = false;
             if (!self.installed) {
                 installing = true;
@@ -4568,7 +5077,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 // rebuild below is the one that renders it), so a
                 // hidden-titlebar header is padded in the very first
                 // paint.
-                if (self.chromeInsetsMsg(runtime, frame_event.window_id)) |msg| {
+                if (try self.chromeInsetsMsg(runtime, frame_event.window_id)) |msg| {
                     self.applyMsg(msg);
                 }
                 try self.rebuild(runtime, frame_event.window_id);
@@ -4610,7 +5119,11 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 // job.
                 self.canvas_size = frame_event.size;
                 try self.rebuild(runtime, frame_event.window_id);
-            } else if (runtime.registeredCanvasFontCount() != self.fonts_built_count) {
+            } else if (if (self.options.font_registry_policy) |policy|
+                @import("font_registry_policy.zig").plan(policy, .refresh, &.{}, runtime.registeredCanvasFontCount(), .{ .built_count = self.fonts_built_count }).action != 0
+            else
+                runtime.registeredCanvasFontCount() != self.fonts_built_count)
+            {
                 // A face joined the registry after install (late
                 // registration through the runtime seam). The runtime
                 // already invalidated measurement caches and requested
@@ -4621,14 +5134,6 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 // rebuilding so layout and the re-emitted display lists
                 // charge the registered face's advances.
                 try self.rebuildForRegisteredFonts(runtime);
-            } else if (self.options.web_panes != null) {
-                // Re-snap the webview panes each presented frame: a shell
-                // relayout that stomped a pane frame also invalidated the
-                // canvas, so the reconciliation ride-along here converges
-                // without a dedicated event.
-                if (runtime.canvasWidgetLayout(frame_event.window_id, self.options.canvas_label)) |layout| {
-                    self.applyWebPanes(runtime, frame_event.window_id, layout);
-                } else |_| {}
             }
             // Terminal outbound pacing: a child that read without
             // echoing freed stdin-FIFO room no output event announces,
@@ -4646,6 +5151,16 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 installing,
                 self.effectiveTokens().colors.background,
             );
+            // The first native present can show the window and synchronously
+            // report its frame. Shell relayout then resets child WebViews to
+            // their manifest frames after rebuild applied the model's panes.
+            // Restore pane ownership before this event commits, so recording
+            // and flat replay observe the same anchored first-frame state.
+            if (self.options.web_panes != null) {
+                if (runtime.canvasWidgetLayout(frame_event.window_id, self.options.canvas_label)) |layout| {
+                    self.applyWebPanes(runtime, frame_event.window_id, layout);
+                } else |_| {}
+            }
             if (installing) return;
             const on_frame = self.options.on_frame orelse return;
             const gpu_frame = runtime.gpuSurfaceFrame(frame_event.window_id, self.options.canvas_label) catch return;
@@ -4662,7 +5177,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         fn handleWindowSlotFrame(self: *Self, runtime: *Runtime, frame_event: platform.GpuSurfaceFrameEvent) anyerror!void {
             const slot = self.windowSlotByCanvasLabel(frame_event.label) orelse return;
             slot.window_id = frame_event.window_id;
-            const scale = normalizedSurfaceScale(frame_event.scale_factor);
+            const scale = self.normalizedSurfaceScale(frame_event.scale_factor);
             var installing = false;
             if (!slot.installed) {
                 installing = true;
@@ -4690,7 +5205,11 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 // stale bounds.
                 slot.canvas_size = frame_event.size;
                 try self.rebuildWindowSlot(runtime, slot);
-            } else if (runtime.registeredCanvasFontCount() != self.fonts_built_count) {
+            } else if (if (self.options.font_registry_policy) |policy|
+                @import("font_registry_policy.zig").plan(policy, .refresh, &.{}, runtime.registeredCanvasFontCount(), .{ .built_count = self.fonts_built_count }).action != 0
+            else
+                runtime.registeredCanvasFontCount() != self.fonts_built_count)
+            {
                 // Late registration, first observed on a secondary
                 // window's frame (registration requests frames for every
                 // open surface, and arrival order is the platform's):
@@ -4803,7 +5322,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// Grow the heap pixel buffers to hold the surface at the given
         /// scale. No-op when they are already large enough.
         fn ensurePixelBuffers(self: *Self, surface_size: geometry.SizeF, scale_factor: f32) anyerror!void {
-            const pixel_size = try canvas_frame.canvasSurfacePixelSize(surface_size, scale_factor);
+            const pixel_size = try canvas_frame.canvasSurfacePixelSizeWithPolicy(surface_size, scale_factor, self.options.render_cache_policy);
             if (self.pixel_buffer.len < pixel_size.byte_len) {
                 self.pixel_buffer_window_id = null;
                 if (self.pixel_buffer.len > 0) self.backing.free(self.pixel_buffer);
@@ -4817,9 +5336,8 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             }
         }
 
-        fn normalizedSurfaceScale(scale_factor: f32) f32 {
-            if (!std.math.isFinite(scale_factor) or scale_factor <= 0) return 1;
-            return scale_factor;
+        fn normalizedSurfaceScale(self: *Self, scale_factor: f32) f32 {
+            return canvas_frame.normalizedCanvasPresentationScaleWithPolicy(scale_factor, 1, self.options.render_cache_policy);
         }
 
         /// Change-detection hashes for the model-derived tray state:
@@ -4917,19 +5435,19 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             if (!std.mem.eql(u8, resize_event.label, self.options.canvas_label)) {
                 const slot = self.windowSlotByCanvasLabel(resize_event.label) orelse return;
                 slot.canvas_size = .{ .width = resize_event.frame.width, .height = resize_event.frame.height };
-                slot.pixel_snap_scale = normalizedSurfaceScale(resize_event.scale_factor);
+                slot.pixel_snap_scale = self.normalizedSurfaceScale(resize_event.scale_factor);
                 if (slot.installed) try self.rebuildWindowSlot(runtime, slot);
                 return;
             }
             self.canvas_size = .{ .width = resize_event.frame.width, .height = resize_event.frame.height };
-            self.pixel_snap_scale = normalizedSurfaceScale(resize_event.scale_factor);
+            self.pixel_snap_scale = self.normalizedSurfaceScale(resize_event.scale_factor);
             if (!self.installed) return;
             // Fullscreen transitions resize the canvas AND flip the
             // chrome overlay insets (macOS hides the titlebar band and
             // traffic lights); re-query on every resize and dispatch
             // only on change — `dispatch` already rebuilds, so the
             // plain-resize rebuild is the else arm.
-            if (self.chromeInsetsMsg(runtime, resize_event.window_id)) |msg| {
+            if (try self.chromeInsetsMsg(runtime, resize_event.window_id)) |msg| {
                 try self.dispatch(runtime, resize_event.window_id, msg);
                 return;
             }
@@ -4961,9 +5479,9 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// The `on_chrome` delivery gate: query the platform's chrome
         /// overlay geometry for the canvas window and map it to a Msg
         /// when the app subscribed AND the geometry actually changed.
-        fn chromeInsetsMsg(self: *Self, runtime: *Runtime, window_id: platform.WindowId) ?MsgT {
+        fn chromeInsetsMsg(self: *Self, runtime: *Runtime, window_id: platform.WindowId) !?MsgT {
             const map = self.options.on_chrome orelse return null;
-            const chrome = runtime.options.platform.services.windowChrome(window_id);
+            const chrome = try runtime.windowChrome(window_id);
             if (self.window_chrome_known and std.meta.eql(chrome, self.window_chrome)) return null;
             self.window_chrome = chrome;
             self.window_chrome_known = true;
@@ -5032,9 +5550,11 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             const terminal_selected = try self.handleTerminalPointer(runtime, pointer_event);
             switch (pointer_event.pointer.phase) {
                 .down => {
-                    self.disarmHold(runtime);
+                    const has_hold = if (pointer_event.press_target) |target| tree.hasHoldHandler(target.id) else false;
+                    const plan = self.pressHoldPlan(0, has_hold, true);
+                    self.applyHoldReset(runtime, plan);
                     if (pointer_event.press_target) |target| {
-                        if (tree.hasHoldHandler(target.id)) {
+                        if (plan & 4 != 0) {
                             self.hold_armed_id = target.id;
                             self.hold_fired = false;
                             // One pointer, one gesture — but it can be
@@ -5050,9 +5570,9 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                     }
                 },
                 .up, .cancel => {
-                    const suppressed = self.hold_fired;
-                    self.disarmHold(runtime);
-                    if (suppressed) return;
+                    const plan = self.pressHoldPlan(1, false, true);
+                    self.applyHoldReset(runtime, plan);
+                    if (plan & 8 != 0) return;
                 },
                 else => {},
             }
@@ -5100,19 +5620,6 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             }
         }
 
-        /// Cap on hover-Msg drain passes per runtime event: each pass
-        /// delivers one coalesced containment transition, and the Msgs
-        /// it dispatches can rebuild the tree and move the standing
-        /// chain again (an enter handler that unmounts the hovered
-        /// element owes an immediate leave — the second pass delivers
-        /// it). The cap exists ONLY as a flap guard (an app whose enter
-        /// mounts and whose leave unmounts, forever), sized far past
-        /// any honest cascade — even one where every enter replaces the
-        /// listener under a stationary pointer — so a finite sequence
-        /// always settles within one drain; residue past the cap
-        /// delivers on the next event's drain.
-        const hover_msg_drain_passes: usize = 64;
-
         /// Refresh every standing capture from the mirror view's live
         /// tree when the trees moved underneath: called at EVERY
         /// rebuild commit — two dispatches in one cycle (payload A to
@@ -5123,64 +5630,54 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// (allocation) after attempting every entry, leaving the
         /// generation behind so the next commit or drain retries.
         fn refreshHoverLeaveCaptures(self: *Self) ?anyerror {
-            if (self.hover_msg_chain_len == 0) return null;
-            if (self.hover_msg_captured_generation == self.build_generation) return null;
-            if (!self.hoverTreeCurrentFor(self.hover_msg_window_id, self.hoverMsgViewLabel())) return null;
-            const mirror_tree = self.hoverTreeFor(self.hover_msg_window_id, self.hoverMsgViewLabel()) orelse return null;
+            const mirror_tree = self.hoverTreeFor(self.hover_msg_window_id, self.hoverMsgViewLabel());
+            if (hover_policy.decide(self.options.surface_scope_policy, .{ .stage = .refresh, .facts = @as(u8, if (self.hover_msg_chain_len != 0) 1 else 0) | @as(u8, if (self.hover_msg_captured_generation == self.build_generation) 2 else 0) |
+                @as(u8, if (self.hoverTreeCurrentFor(self.hover_msg_window_id, self.hoverMsgViewLabel())) 4 else 0) | @as(u8, if (mirror_tree != null) 8 else 0) }) == 0) return null;
             var first_error: ?anyerror = null;
             var refreshed = true;
             for (0..self.hover_msg_chain_len) |position| {
                 // A refused entry's pair is disabled (its enter never
                 // dispatched); a rebind only takes effect on re-entry.
-                if (self.hover_msg_slots[position] == hover_msg_slot_refused) continue;
-                const leave_msg = mirror_tree.msgFor(self.hover_msg_chain[position], .hover_leave) orelse continue;
+                const leave_msg = if (mirror_tree) |tree| tree.msgFor(self.hover_msg_chain[position], .hover_leave) else null;
+                if (hover_policy.decide(self.options.surface_scope_policy, .{ .stage = .refresh_entry, .facts = @as(u8, if (self.hover_msg_slots[position] == hover_msg_slot_refused) 1 else 0) | @as(u8, if (leave_msg != null) 2 else 0) }) == 0) continue;
                 // Copy-then-swap: the replacement lands in a FRESH slot
                 // (the pool sizing guarantees one is free) and the old
                 // capture releases only after it succeeded — a failed
                 // allocation must never destroy the still-valid capture
                 // it was refreshing.
                 const fresh = self.claimHoverSlot() orelse {
-                    refreshed = false;
-                    ui_app_log.warn("hover-leave capture refresh failed: no free capture slot - retrying at the next rebuild or drain", .{});
-                    if (first_error == null) first_error = error.OutOfMemory;
-                    continue;
-                };
-                self.captureHoverLeave(fresh, leave_msg) catch |err| {
-                    self.releaseHoverSlot(fresh);
-                    switch (err) {
-                        error.OutOfMemory => {
-                            // Transient: keep the old capture, retry at
-                            // the next commit or drain — the generation
-                            // stays behind — and surface the failure
-                            // LOUD: if the element unmounts before a
-                            // retry lands, its refreshed leave is lost,
-                            // and that must never be silent.
-                            refreshed = false;
-                            ui_app_log.warn("hover-leave capture refresh failed: {t} - retrying at the next rebuild or drain; an unmount before a successful retry loses the newly bound leave", .{err});
-                            if (first_error == null) first_error = err;
-                        },
-                        error.HoverCapturePayloadUnsupported => {
-                            // A rebind to an unownable payload. An
-                            // entry with a standing capture keeps it
-                            // quietly (the promise the enter earned);
-                            // an entry that never had one — entered
-                            // with no leave bound, then given one no
-                            // copy can own — is marked so the
-                            // degradation is WARNED once, not silent,
-                            // and not re-warned every generation.
-                            if (self.hover_msg_slots[position] == hover_msg_slot_none) {
-                                self.hover_msg_slots[position] = hover_msg_slot_unowned;
-                                ui_app_log.warn("on_hover_leave rebind cannot be owned (a single-item pointer): the standing element's leave degrades to live-tree resolution, and an unmount loses it - bind a slice or scalar payload instead", .{});
-                            }
-                        },
+                    if (self.hoverCaptureDecision(0, 0, self.hover_msg_slots[position]) == 1) {
+                        refreshed = false;
+                        ui_app_log.warn("hover-leave capture refresh failed: no free capture slot - retrying at the next rebuild or drain", .{});
+                        if (first_error == null) first_error = error.OutOfMemory;
                     }
                     continue;
                 };
-                self.releaseHoverSlot(self.hover_msg_slots[position]);
-                self.hover_msg_slots[position] = fresh;
+                self.captureHoverLeave(fresh, leave_msg.?) catch |err| {
+                    self.releaseHoverSlot(fresh);
+                    const action = self.hoverCaptureDecision(0, if (err == error.OutOfMemory) 0 else 1, self.hover_msg_slots[position]);
+                    if (action == 1) {
+                        refreshed = false;
+                        ui_app_log.warn("hover-leave capture refresh failed: {t} - retrying at the next rebuild or drain; an unmount before a successful retry loses the newly bound leave", .{err});
+                        if (first_error == null) first_error = err;
+                    } else if (action == 3) {
+                        self.hover_msg_slots[position] = hover_msg_slot_unowned;
+                        ui_app_log.warn("on_hover_leave rebind cannot be owned (a single-item pointer): the standing element's leave degrades to live-tree resolution, and an unmount loses it - bind a slice or scalar payload instead", .{});
+                    }
+                    continue;
+                };
+                if (self.hoverCaptureDecision(0, 2, self.hover_msg_slots[position]) == 4) {
+                    self.releaseHoverSlot(self.hover_msg_slots[position]);
+                    self.hover_msg_slots[position] = fresh;
+                } else self.releaseHoverSlot(fresh);
             }
             if (refreshed) self.hover_msg_captured_generation = self.build_generation;
             return first_error;
+        }
+
+        fn hoverCaptureDecision(self: *const Self, context: u8, outcome: u8, slot: u8) u8 {
+            const kind: u8 = if (slot == hover_msg_slot_none) 0 else if (slot == hover_msg_slot_refused) 1 else if (slot == hover_msg_slot_unowned) 2 else 3;
+            return hover_policy.decide(self.options.surface_scope_policy, .{ .stage = .capture, .a = context, .b = outcome, .facts = kind });
         }
 
         /// The mirror-view adoption count for the tracked publication
@@ -5201,8 +5698,23 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// still mark the pair stale, while a pre-adoption rejection
         /// must not. The view's adoption counter is the witness.
         fn publishWidgetLayoutTracked(self: *Self, runtime: *Runtime, window_id: platform.WindowId, label: []const u8, layout: canvas.WidgetLayoutTree, current_flag: *bool) anyerror!void {
-            _ = self;
             const adoptions_before = canvasWidgetLayoutAdoptions(runtime, window_id, label);
+            defer {
+                // Adoption precedes fallible host synchronization. Stamp
+                // the policy even when those later operations fail, while
+                // leaving a rejected publication's retained policy intact.
+                if (canvasWidgetLayoutAdoptions(runtime, window_id, label) != adoptions_before) {
+                    for (runtime.views[0..runtime.view_count]) |*view| {
+                        if (view.window_id == window_id and std.mem.eql(u8, view.label, label)) {
+                            view.canvas_widget_tab_focus_policy = self.options.tab_focus_policy;
+                            view.canvas_widget_surface_scope_policy = self.options.surface_scope_policy;
+                            view.canvas_widget_focus_return_policy = self.options.focus_return_policy;
+                            view.canvas_widget_tooltip_policy = self.options.tooltip_policy;
+                            break;
+                        }
+                    }
+                }
+            }
             _ = runtime.setCanvasWidgetLayout(window_id, label, layout) catch |err| {
                 if (canvasWidgetLayoutAdoptions(runtime, window_id, label) != adoptions_before) current_flag.* = false;
                 return err;
@@ -5397,8 +5909,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// dispatches, which is what "discrete edges, never per-move"
         /// means under a fast pointer.
         fn drainHoverMsgs(self: *Self, runtime: *Runtime) anyerror!void {
-            if (!self.installed) return;
-            if (self.hover_msg_draining) return;
+            if (hover_policy.decide(self.options.surface_scope_policy, .{ .stage = .drain, .facts = @as(u8, if (self.installed) 1 else 0) | @as(u8, if (self.hover_msg_draining) 2 else 0) }) == 0) return;
             self.hover_msg_draining = true;
             defer self.hover_msg_draining = false;
             // A pass's error degrades WITHOUT aborting the drain: its
@@ -5409,12 +5920,12 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             // degraded handling every event handler gets.
             var first_error: ?anyerror = null;
             var passes: usize = 0;
-            while (passes < hover_msg_drain_passes) : (passes += 1) {
+            while (hover_policy.decide(self.options.surface_scope_policy, .{ .stage = .continuation, .a = @intCast(passes), .facts = 1 }) != 0) : (passes += 1) {
                 const progressed = self.stepHoverMsgs(runtime) catch |err| blk: {
                     if (first_error == null) first_error = err;
                     break :blk true;
                 };
-                if (!progressed) break;
+                if (hover_policy.decide(self.options.surface_scope_policy, .{ .stage = .continuation, .a = @intCast(passes + 1), .facts = @intFromBool(progressed) }) == 0) break;
             }
             if (first_error) |err| return err;
         }
@@ -5432,15 +5943,11 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         fn stepHoverMsgs(self: *Self, runtime: *Runtime) anyerror!bool {
             var standing_index: ?usize = null;
             for (runtime.views[0..runtime.view_count], 0..) |*view, index| {
-                if (view.kind != .gpu_surface) continue;
-                if (view.canvas_widget_hover_msg_chain_len == 0) continue;
-                const is_mirror = view.window_id == self.hover_msg_window_id and
-                    std.mem.eql(u8, view.label, self.hoverMsgViewLabel());
-                if (is_mirror) {
-                    standing_index = index;
-                    break;
-                }
-                if (standing_index == null) standing_index = index;
+                const is_mirror = view.window_id == self.hover_msg_window_id and std.mem.eql(u8, view.label, self.hoverMsgViewLabel());
+                const action = hover_policy.decide(self.options.surface_scope_policy, .{ .stage = .view, .facts = @as(u8, if (view.kind == .gpu_surface) 1 else 0) | @as(u8, if (view.canvas_widget_hover_msg_chain_len != 0) 2 else 0) |
+                    @as(u8, if (is_mirror) 4 else 0) | @as(u8, if (standing_index != null) 8 else 0) });
+                if (action != 0) standing_index = index;
+                if (action == 2) break;
             }
 
             // The standing chain and the view identity it belongs to
@@ -5491,28 +5998,13 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             // A view change retains nothing (one pointer, one view).
             var retained_slots: [canvas.max_widget_depth]u8 = undefined;
             var entering_at: [canvas.max_widget_depth]bool = undefined;
-            var entering_any = false;
-            var identical = same_view and standing_len == mirror_len;
-            for (standing_chain[0..standing_len], 0..) |id, position| {
-                var slot: u8 = hover_msg_slot_none;
-                var retained = false;
-                if (same_view) {
-                    for (self.hover_msg_chain[0..mirror_len], 0..) |mirror_id, mirror_position| {
-                        if (mirror_id != id) continue;
-                        slot = self.hover_msg_slots[mirror_position];
-                        retained = true;
-                        if (mirror_position != position) identical = false;
-                        break;
-                    }
-                }
-                retained_slots[position] = slot;
-                entering_at[position] = !retained;
-                if (!retained) {
-                    entering_any = true;
-                    identical = false;
-                }
+            const plan = hover_policy.plan(self.options.surface_scope_policy, same_view, self.hover_msg_chain[0..mirror_len], standing_chain[0..standing_len]);
+            for (0..standing_len) |position| {
+                const retained = plan.retained[position];
+                retained_slots[position] = if (retained == 255) hover_msg_slot_none else self.hover_msg_slots[retained];
+                entering_at[position] = retained == 255;
             }
-            if (identical) {
+            if (plan.identical) {
                 if (first_error) |err| return err;
                 return false;
             }
@@ -5528,26 +6020,11 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             // while the leaves this transition owes still dispatch
             // below — their Msgs are owned captures, not tree lookups,
             // and a broken destination must never withhold them.
-            const destination_ready = !entering_any or
-                (self.hoverTreeCurrentFor(standing_window, standing_label) and self.hoverTreeFor(standing_window, standing_label) != null);
-            if (!destination_ready) {
-                var any_leaving = false;
-                for (self.hover_msg_chain[0..mirror_len]) |id| {
-                    const still_standing = same_view and blk: {
-                        for (standing_chain[0..standing_len]) |candidate| {
-                            if (candidate == id) break :blk true;
-                        }
-                        break :blk false;
-                    };
-                    if (!still_standing) {
-                        any_leaving = true;
-                        break;
-                    }
-                }
-                // Nothing deliverable now: enters wait for a current
-                // tree, retained entries stay put.
-                if (!any_leaving) return false;
-            }
+            const destination_ready = hover_policy.decide(self.options.surface_scope_policy, .{ .stage = .enter, .facts = 1 |
+                @as(u8, if (plan.entering) 2 else 0) | @as(u8, if (self.hoverTreeCurrentFor(standing_window, standing_label)) 4 else 0) |
+                @as(u8, if (self.hoverTreeFor(standing_window, standing_label) != null) 8 else 0) }) != 2;
+            // Deferred enters stay outside the mirror, but owned leaves still deliver.
+            if (!destination_ready and plan.leave_count == 0) return false;
 
             // The leaves this pass owes — mirror ids absent from the
             // standing chain — innermost-first. Their captured Msgs own
@@ -5562,21 +6039,10 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             @memcpy(leave_label_storage[0..leave_label_len], self.hover_msg_view_label_storage[0..leave_label_len]);
             var leave_ids: [canvas.max_widget_depth]canvas.ObjectId = undefined;
             var leave_slots: [canvas.max_widget_depth]u8 = undefined;
-            var leave_count: usize = 0;
-            var index = mirror_len;
-            while (index > 0) {
-                index -= 1;
-                const id = self.hover_msg_chain[index];
-                const still_standing = same_view and blk: {
-                    for (standing_chain[0..standing_len]) |candidate| {
-                        if (candidate == id) break :blk true;
-                    }
-                    break :blk false;
-                };
-                if (still_standing) continue;
-                leave_ids[leave_count] = id;
-                leave_slots[leave_count] = self.hover_msg_slots[index];
-                leave_count += 1;
+            const leave_count = plan.leave_count;
+            for (plan.leaving[0..leave_count], 0..) |index, position| {
+                leave_ids[position] = self.hover_msg_chain[index];
+                leave_slots[position] = self.hover_msg_slots[index];
             }
 
             // Commit the mirror before dispatching so a mid-dispatch
@@ -5610,18 +6076,12 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             // — and the first error propagates after the batch, into
             // the same degraded handling every event handler gets.
             for (leave_ids[0..leave_count], leave_slots[0..leave_count]) |id, slot| {
-                // A refused entry never entered: it owes nothing on
-                // exit.
-                if (slot == hover_msg_slot_refused) continue;
-                // The capture wins (leave answers what enter announced);
-                // an unowned capture falls back to the live tree while
-                // its element still stands there.
                 const captured: ?MsgT = if (slot >= hover_msg_slot_count) null else self.hover_msg_leave_msgs[slot];
-                const msg = captured orelse blk: {
-                    if (!self.hoverTreeCurrentFor(leave_window, leave_label_storage[0..leave_label_len])) break :blk null;
-                    const live = self.hoverTreeFor(leave_window, leave_label_storage[0..leave_label_len]) orelse break :blk null;
-                    break :blk live.msgFor(id, .hover_leave);
-                } orelse {
+                const live = self.hoverTreeFor(leave_window, leave_label_storage[0..leave_label_len]);
+                const resolution = hover_policy.decide(self.options.surface_scope_policy, .{ .stage = .leave, .facts = @as(u8, if (slot == hover_msg_slot_refused) 1 else 0) | @as(u8, if (captured != null) 2 else 0) |
+                    @as(u8, if (self.hoverTreeCurrentFor(leave_window, leave_label_storage[0..leave_label_len])) 4 else 0) | @as(u8, if (live != null) 8 else 0) });
+                if (resolution == 0) continue;
+                const msg = (if (resolution == 1) captured else if (resolution == 2) live.?.msgFor(id, .hover_leave) else null) orelse {
                     self.releaseHoverSlot(slot);
                     continue;
                 };
@@ -5634,69 +6094,47 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 self.releaseHoverSlot(slot);
             }
             for (standing_chain[0..standing_len], 0..) |id, position| {
-                if (!destination_ready) break;
-                if (!entering_at[position]) continue;
-                if (!self.hoverTreeCurrentFor(standing_window, standing_label)) {
-                    // An earlier edge's failed rebuild left this tree
-                    // stale mid-batch: the same deferral as above — drop
-                    // the unentered tail from the mirror and retry after
-                    // a rebuild lands.
+                const live = self.hoverTreeFor(standing_window, standing_label);
+                const admission = hover_policy.decide(self.options.surface_scope_policy, .{ .stage = .enter, .facts = @as(u8, if (destination_ready) 1 else 0) | @as(u8, if (entering_at[position]) 2 else 0) |
+                    @as(u8, if (self.hoverTreeCurrentFor(standing_window, standing_label)) 4 else 0) | @as(u8, if (live != null) 8 else 0) });
+                if (admission == 0) break;
+                if (admission == 1) continue;
+                if (admission == 2) {
                     self.unwindHoverEnters(&entering_at, position);
                     break;
                 }
-                // Resolve from the LIVE tree per edge: an earlier edge
-                // in this batch may have rebuilt the view (payload
-                // bytes are only promised for their own dispatch), and
-                // its update may even have unmounted this element — a
-                // vanished handler then dispatches no enter and owes no
-                // leave. The paired leave is captured BEFORE the enter
-                // dispatches, from the same tree that resolved it, so
-                // an enter whose own handler unmounts the element still
-                // has its leave to deliver.
-                const live = self.hoverTreeFor(standing_window, standing_label) orelse {
-                    // A failed rebuild cleared the tree mid-batch: drop
-                    // the not-yet-entered ids from the mirror so the
-                    // next drain retries them once the tree returns (the
-                    // entering-with-no-tree deferral above then holds
-                    // the line instead of consuming enters as silence).
-                    self.unwindHoverEnters(&entering_at, position);
-                    break;
-                };
-                const enter_msg = live.msgFor(id, .hover_enter);
-                if (live.msgFor(id, .hover_leave)) |leave_msg| {
+                // Resolve each edge from the current tree; own its paired leave before dispatch.
+                const enter_msg = live.?.msgFor(id, .hover_enter);
+                if (live.?.msgFor(id, .hover_leave)) |leave_msg| {
                     const slot = self.claimHoverSlot() orelse {
                         // Pool pressure degrades like allocation
                         // pressure: defer this id and the entering tail
                         // to the next drain.
-                        self.unwindHoverEnters(&entering_at, position);
-                        if (first_error == null) first_error = error.OutOfMemory;
+                        if (self.hoverCaptureDecision(1, 0, self.hover_msg_slots[position]) == 1) {
+                            self.unwindHoverEnters(&entering_at, position);
+                            if (first_error == null) first_error = error.OutOfMemory;
+                        }
                         break;
                     };
-                    self.captureHoverLeave(slot, leave_msg) catch |err| switch (err) {
-                        error.OutOfMemory => {
-                            // Transient: an enter whose paired leave
-                            // cannot be owned must not dispatch — defer
-                            // this id and the rest of the entering tail
-                            // to the next drain instead of breaking the
-                            // pairing guarantee.
-                            self.releaseHoverSlot(slot);
+                    self.captureHoverLeave(slot, leave_msg) catch |err| {
+                        self.releaseHoverSlot(slot);
+                        const action = self.hoverCaptureDecision(1, if (err == error.OutOfMemory) 0 else 1, self.hover_msg_slots[position]);
+                        if (action == 1) {
                             self.unwindHoverEnters(&entering_at, position);
                             if (first_error == null) first_error = error.OutOfMemory;
                             break;
-                        },
-                        error.HoverCapturePayloadUnsupported => {
-                            // Permanent: no copy can own this payload
-                            // (a single-item pointer), so the PAIR is
-                            // disabled — the enter is refused too,
-                            // once, loudly, and the entry settles as
-                            // refused instead of retrying every drain.
-                            self.releaseHoverSlot(slot);
+                        }
+                        if (action == 2) {
                             self.releaseHoverSlot(self.hover_msg_slots[position]);
                             self.hover_msg_slots[position] = hover_msg_slot_refused;
                             ui_app_log.warn("on_hover_leave payload cannot be owned (a single-item pointer): the hover pair is disabled for this element - bind a slice or scalar payload instead", .{});
-                            continue;
-                        },
+                        }
+                        continue;
                     };
+                    if (self.hoverCaptureDecision(1, 2, self.hover_msg_slots[position]) != 4) {
+                        self.releaseHoverSlot(slot);
+                        continue;
+                    }
                     // A mid-batch rebuild's capture refresh can have
                     // filled this position's slot already (an earlier
                     // edge's dispatch rebuilt): release it before the
@@ -5724,20 +6162,17 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// sees them as entering again and retries. Their positions hold
         /// no capture slots yet, so nothing needs releasing.
         fn unwindHoverEnters(self: *Self, entering_at: *const [canvas.max_widget_depth]bool, from: usize) void {
-            var kept: usize = 0;
+            const compaction = hover_policy.unwind(self.options.surface_scope_policy, entering_at[0..self.hover_msg_chain_len], from);
+            // Release discarded claims before compacting the native id/slot storage.
+            var kept_position: usize = 0;
             for (0..self.hover_msg_chain_len) |position| {
-                if (position >= from and entering_at[position]) {
-                    // A mid-batch capture refresh can have filled this
-                    // never-entered position's slot: release it so an
-                    // unwound enter never leaks its claim.
-                    self.releaseHoverSlot(self.hover_msg_slots[position]);
-                    continue;
-                }
+                if (kept_position < compaction.len and compaction.kept[kept_position] == position) kept_position += 1 else self.releaseHoverSlot(self.hover_msg_slots[position]);
+            }
+            for (compaction.kept[0..compaction.len], 0..) |position, kept| {
                 self.hover_msg_chain[kept] = self.hover_msg_chain[position];
                 self.hover_msg_slots[kept] = self.hover_msg_slots[position];
-                kept += 1;
             }
-            self.hover_msg_chain_len = kept;
+            self.hover_msg_chain_len = compaction.len;
         }
 
         /// Re-render the house video chrome from the moved channel
@@ -5782,10 +6217,44 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             try self.rebuildVideoChrome(runtime);
         }
 
+        fn pressHoldPlan(self: *const Self, operation: u8, has_hold: bool, tree_available: bool) u8 {
+            const armed = self.hold_armed_id != 0;
+            if (self.options.press_hold_policy) |policy| {
+                const facts = @as(u8, @intFromBool(armed)) |
+                    (@as(u8, @intFromBool(self.hold_fired)) << 1) |
+                    (@as(u8, @intFromBool(has_hold)) << 2) |
+                    (@as(u8, @intFromBool(tree_available)) << 3);
+                const request = [_]u8{ 19, operation, facts };
+                var result: [1]u8 = undefined;
+                const allowed: u8 = switch (operation) {
+                    0 => 7,
+                    1 => 11,
+                    2 => 16,
+                    3 => 3,
+                    else => unreachable,
+                };
+                if (policy(&request, &result) != result.len or result[0] & ~allowed != 0 or
+                    (result[0] & 4 != 0 and !has_hold) or
+                    (result[0] & 16 != 0 and (!armed or self.hold_fired or !tree_available)))
+                    @panic("invalid compiled press hold result");
+                return result[0];
+            }
+            if (operation == 2) return if (armed and !self.hold_fired and tree_available) 16 else 0;
+            const reset: u8 = 2 | @as(u8, @intFromBool(armed and !self.hold_fired));
+            return reset | (if (operation == 0 and has_hold) @as(u8, 4) else 0) |
+                (if (operation == 1 and self.hold_fired) @as(u8, 8) else 0);
+        }
+
+        fn applyHoldReset(self: *Self, runtime: *Runtime, plan: u8) void {
+            if (plan & 1 != 0) runtime.cancelTimer(press_hold_timer_id) catch {};
+            if (plan & 2 != 0) {
+                self.hold_armed_id = 0;
+                self.hold_fired = false;
+            }
+        }
+
         fn disarmHold(self: *Self, runtime: *Runtime) void {
-            if (self.hold_armed_id != 0 and !self.hold_fired) runtime.cancelTimer(press_hold_timer_id) catch {};
-            self.hold_armed_id = 0;
-            self.hold_fired = false;
+            self.applyHoldReset(runtime, self.pressHoldPlan(3, false, false));
         }
 
         /// The hold timer fired while the press is still down: dispatch
@@ -5794,11 +6263,11 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// that this gesture consumed its press.
         fn firePressHold(self: *Self, runtime: *Runtime) anyerror!void {
             const armed_id = self.hold_armed_id;
-            if (armed_id == 0 or self.hold_fired) return;
             const hold_label = self.hold_view_label_storage[0..self.hold_view_label_len];
-            const tree = self.treeForViewLabel(hold_label) orelse return;
+            const tree = if (armed_id != 0 and !self.hold_fired) self.treeForViewLabel(hold_label) else null;
+            if (self.pressHoldPlan(2, false, tree != null) & 16 == 0) return;
             self.hold_fired = true;
-            if (tree.msgForHold(armed_id)) |msg| {
+            if (tree.?.msgForHold(armed_id)) |msg| {
                 try self.dispatch(runtime, self.hold_window_id, msg);
             }
         }
@@ -5815,14 +6284,12 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             // on_dismiss (its open state lives here, not in the model):
             // close the state and rebuild, agreeing with the engine's
             // optimistic hide.
-            if (self.context_menu_fallback_target != 0) {
-                if (tree.context_menu_fallback) |fallback| {
-                    if (fallback.surface_id == dismiss_event.id) {
-                        self.clearContextMenuFallback();
-                        try self.rebuildAllViews(runtime);
-                        return;
-                    }
-                }
+            const fallback = tree.context_menu_fallback;
+            const matches = if (fallback) |value| value.surface_id == dismiss_event.id else false;
+            if (self.componentDecision(.fallback_dismiss, self.context_menu_fallback_target != 0, fallback != null, matches) != 0) {
+                self.clearContextMenuFallback();
+                try self.rebuildAllViews(runtime);
+                return;
             }
             if (tree.msgForDismiss(dismiss_event.id)) |msg| {
                 try self.dispatch(runtime, dismiss_event.window_id, msg);
@@ -6124,19 +6591,12 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// point, and view dimensions so it can preview a semantic insertion
         /// during motion, commit it on release, or restore it on cancel.
         fn handleWidgetDrag(self: *Self, runtime: *Runtime, drag_event: core.CanvasWidgetDragEvent) anyerror!void {
-            // The runtime promotes a source only after this slop, so terminal
-            // phases are always real drags and must dispatch even when the
-            // pointer returned near its origin before release. Change events
-            // below slop remain on the low-level channel to own text motion,
-            // but declarative apps do not hear them.
-            if (drag_event.drag.phase == .change and
-                !canvas_widget_events.canvasWidgetDragCrossedSlop(drag_event.drag.delta)) return;
-            const source = drag_event.source orelse return;
-            // Once drag wins the pointer gesture it also owns its delayed
-            // interpretation. An element may declare both on-hold and on-drag;
-            // leaving the down-armed timer live would dispatch the hold Msg in
-            // the middle of a stationary drag and then dispatch drag end too.
-            if (drag_event.drag.phase == .change) self.disarmHold(runtime);
+            const policy = self.options.surface_scope_policy;
+            const phase = drag_policy.dragPhase(drag_event.drag.phase);
+            const admission = drag_policy.decide(policy, .{ .stage = .delivery, .phase = phase, .facts = @intFromBool(drag_event.source != null), .delta = drag_event.drag.delta });
+            if (admission == 0) return;
+            const source = drag_event.source.?;
+            if (admission == 1) self.disarmHold(runtime);
             const tree = self.treeForViewLabel(drag_event.view_label);
             const live_template = if (tree) |value| value.msgFor(source.id, .drag) else null;
             const layout: ?canvas.WidgetLayoutTree = runtime.canvasWidgetLayout(drag_event.window_id, drag_event.view_label) catch null;
@@ -6144,31 +6604,23 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 const root = root_value.normalized();
                 break :blk geometry.SizeF.init(root.width, root.height);
             } else null else null;
-
-            if (drag_event.drag.phase == .change) {
-                const template = live_template orelse return;
-                const view_size = live_view_size orelse return;
-                const msg = Ui.Tree.msgForDragTemplate(template, drag_event.drag, view_size) orelse return;
-                // Capture before dispatch: this very Msg may rebuild the tree
-                // without its source or handler.
-                try self.captureWidgetDragMsg(drag_event, template, view_size);
-                try self.dispatch(runtime, drag_event.window_id, msg);
+            const captured = if (admission == 2) self.widgetDragCaptureMatches(drag_event.window_id, drag_event.view_label, source.id) else false;
+            const resolve = drag_policy.decide(policy, .{ .stage = .resolve, .phase = phase, .facts = @as(u8, if (live_template != null) 1 else 0) | @as(u8, if (live_view_size != null) 2 else 0) |
+                @as(u8, if (captured) 4 else 0) | @as(u8, if (self.drag_msg_template != null) 8 else 0) });
+            if (resolve == 32) {
+                self.clearWidgetDragMsgCapture();
                 return;
             }
-
-            const captured = self.widgetDragCaptureMatches(drag_event.window_id, drag_event.view_label, source.id);
-            const maybe_template: ?MsgT = live_template orelse if (captured) self.drag_msg_template else null;
-            const template = maybe_template orelse {
-                if (captured) self.clearWidgetDragMsgCapture();
-                return;
-            };
-            const view_size = live_view_size orelse if (captured) self.drag_msg_view_size else return;
-            const msg = Ui.Tree.msgForDragTemplate(template, drag_event.drag, view_size) orelse {
-                if (captured) self.clearWidgetDragMsgCapture();
-                return;
-            };
-            defer if (captured) self.clearWidgetDragMsgCapture();
-            try self.dispatch(runtime, drag_event.window_id, msg);
+            if (resolve == 0) return;
+            const template = if (resolve & 1 != 0) live_template.? else self.drag_msg_template.?;
+            const view_size = if (resolve & 4 != 0) live_view_size.? else self.drag_msg_view_size;
+            const msg = Ui.Tree.msgForDragTemplate(template, drag_event.drag, view_size);
+            const action = drag_policy.decide(policy, .{ .stage = .message, .phase = phase, .facts = @as(u8, if (msg != null) 1 else 0) | @as(u8, if (captured) 2 else 0) });
+            defer if (action & 4 != 0) self.clearWidgetDragMsgCapture();
+            if (action & 1 == 0) return;
+            // Copy before dispatch: the resulting Msg may remove its source.
+            if (action & 2 != 0) try self.captureWidgetDragMsg(drag_event, template, view_size);
+            try self.dispatch(runtime, drag_event.window_id, msg.?);
         }
 
         fn captureWidgetDragMsg(self: *Self, drag_event: core.CanvasWidgetDragEvent, template: MsgT, view_size: geometry.SizeF) anyerror!void {
@@ -6189,10 +6641,9 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         }
 
         fn widgetDragCaptureMatches(self: *const Self, window_id: platform.WindowId, view_label: []const u8, source_id: canvas.ObjectId) bool {
-            return self.drag_msg_template != null and
-                self.drag_msg_window_id == window_id and
-                self.drag_msg_source_id == source_id and
-                std.mem.eql(u8, self.drag_msg_view_label_storage[0..self.drag_msg_view_label_len], view_label);
+            return drag_policy.decide(self.options.surface_scope_policy, .{ .stage = .capture_match, .facts = @as(u8, if (self.drag_msg_template != null) 1 else 0) | @as(u8, if (self.drag_msg_window_id == window_id) 2 else 0) |
+                @as(u8, if (self.drag_msg_source_id == source_id) 4 else 0) |
+                @as(u8, if (std.mem.eql(u8, self.drag_msg_view_label_storage[0..self.drag_msg_view_label_len], view_label)) 8 else 0) }) != 0;
         }
 
         fn clearWidgetDragMsgCapture(self: *Self) void {
@@ -6264,10 +6715,8 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                     rebuilt = true;
                 }
             }
-            if (!rebuilt and self.installed and
-                std.mem.eql(u8, scroll_event.view_label, self.options.canvas_label) and
-                self.isVirtualWindowId(scroll_event.id))
-            {
+            const rebuild_plan = component_policy.plan(self.options.component_policy, .scroll_rebuild, rebuilt, self.installed, std.mem.eql(u8, scroll_event.view_label, self.options.canvas_label), @intFromBool(self.isVirtualWindowId(scroll_event.id)), 0);
+            if (rebuild_plan[0] != 0) {
                 try self.rebuild(runtime, scroll_event.window_id);
             }
         }
@@ -6288,20 +6737,26 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             // the tree first — silently arming nothing would leave the
             // presented menu's selection to fall through a null tree
             // and dispatch no message.
-            if (self.treeForViewLabel(shown_event.view_label) == null) try self.restoreMissingTree(runtime);
+            if (self.componentDecision(.missing_tree, self.treeForViewLabel(shown_event.view_label) == null, false, false) != 0) try self.restoreMissingTree(runtime);
             const tree = self.treeForViewLabel(shown_event.view_label) orelse return;
-            const count = @min(shown_event.item_count, self.context_menu_shown_msgs.len);
+            const count_plan = component_policy.plan(self.options.component_policy, .shown_count, false, false, false, shown_event.item_count, self.context_menu_shown_msgs.len);
+            const count: usize = @intCast(std.mem.readInt(u64, count_plan[8..16], .little));
             for (0..count) |item_index| {
                 self.context_menu_shown_msgs[item_index] = tree.msgForContextMenu(shown_event.target_id, item_index);
             }
             self.context_menu_shown_token = shown_event.token;
             self.context_menu_shown_count = count;
-            self.context_menu_pin = if (std.mem.eql(u8, shown_event.view_label, self.options.canvas_label))
-                .{ .window_id = null, .arena_index = self.arena_index }
-            else if (self.windowSlotByCanvasLabel(shown_event.view_label)) |slot|
-                .{ .window_id = slot.window_id, .arena_index = slot.arena_index }
-            else
-                null;
+            const slot = self.windowSlotByCanvasLabel(shown_event.view_label);
+            const owner = self.componentDecision(.pin_owner, std.mem.eql(u8, shown_event.view_label, self.options.canvas_label), slot != null, false);
+            self.context_menu_pin = switch (owner) {
+                1 => .{ .window_id = null, .arena_index = self.arena_index },
+                2 => .{ .window_id = slot.?.window_id, .arena_index = slot.?.arena_index },
+                else => null,
+            };
+        }
+
+        fn componentDecision(self: *const Self, stage: component_policy.Stage, a: bool, b: bool, c: bool) u8 {
+            return component_policy.plan(self.options.component_policy, stage, a, b, c, 0, 0)[0];
         }
 
         /// The arena index this canvas's next rebuild must use:
@@ -6315,13 +6770,10 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// therefore bounded at two trees, however many rebuilds occur.
         fn contextMenuRebuildIndex(self: *const Self, window_id: ?platform.WindowId, current_index: usize) usize {
             const natural = current_index ^ 1;
-            const pin = self.context_menu_pin orelse return natural;
-            if (pin.arena_index != natural) return natural;
-            const matches = if (pin.window_id) |pin_window|
-                (window_id orelse return natural) == pin_window
-            else
-                window_id == null;
-            return if (matches) natural ^ 1 else natural;
+            const pin = self.context_menu_pin;
+            const matches = if (pin) |value| value.window_id == window_id else false;
+            const pinned = if (pin) |value| value.arena_index == natural else false;
+            return natural ^ self.componentDecision(.rebuild_arena, pin != null, pinned, matches);
         }
 
         /// Window teardown for the pin's owner: the slot's arenas are
@@ -6330,9 +6782,10 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// a stale pin would otherwise keep steering the reused slot's
         /// rebuild cadence around a generation that no longer exists.
         fn releaseContextMenuSnapshotForWindow(self: *Self, window_id: platform.WindowId) void {
-            const pin = self.context_menu_pin orelse return;
-            const pin_window = pin.window_id orelse return;
-            if (pin_window == window_id) self.releaseContextMenuSnapshot();
+            const pin = self.context_menu_pin;
+            const has_window = if (pin) |value| value.window_id != null else false;
+            const matches = if (pin) |value| value.window_id == window_id else false;
+            if (self.componentDecision(.release_window, pin != null, has_window, matches) != 0) self.releaseContextMenuSnapshot();
         }
 
         /// Disarm the presented-menu snapshot and release the pinned
@@ -6350,7 +6803,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// token's notice is ignored (a superseding presentation
         /// already replaced the snapshot and the pin).
         fn handleContextMenuDismissed(self: *Self, runtime: *Runtime, dismissed_event: core.CanvasWidgetContextMenuDismissedEvent) anyerror!void {
-            if (dismissed_event.token == 0 or dismissed_event.token != self.context_menu_shown_token) return;
+            if (self.componentDecision(.dismiss_token, dismissed_event.token != 0, dismissed_event.token == self.context_menu_shown_token, false) == 0) return;
             self.releaseContextMenuSnapshot();
             try self.restoreMissingTree(runtime);
         }
@@ -6364,12 +6817,11 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// no-ops until an unrelated resize, timer, or effect happens
         /// to rebuild.
         fn restoreMissingTree(self: *Self, runtime: *Runtime) anyerror!void {
-            if (!self.installed) return;
-            var missing = self.tree == null;
+            var secondary_missing = false;
             for (self.window_slots[0..self.window_slot_count]) |*slot| {
-                if (slot.installed and slot.tree == null) missing = true;
+                if (slot.installed and slot.tree == null) secondary_missing = true;
             }
-            if (missing) try self.rebuildAllViews(runtime);
+            if (self.componentDecision(.restore_tree, self.installed, self.tree == null, secondary_missing) != 0) try self.rebuildAllViews(runtime);
         }
 
         /// A native context-menu selection: resolve the selected item's
@@ -6382,32 +6834,30 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             // A selection on this menu closes it whatever the source: an
             // automation-invoked selection while the fallback surface is
             // open must not leave the surface mounted.
-            if (self.context_menu_fallback_target == menu_event.target_id) {
-                self.clearContextMenuFallback();
-            }
-            if (menu_event.token != 0 and menu_event.token == self.context_menu_shown_token) {
+            const begin = self.componentDecision(.selection_begin, self.context_menu_fallback_target == menu_event.target_id, menu_event.token != 0, menu_event.token == self.context_menu_shown_token);
+            if (begin & 1 != 0) self.clearContextMenuFallback();
+            if (begin & 2 != 0) {
                 const count = self.context_menu_shown_count;
                 // The request is consumed on every path out of this
                 // block — resolved, out-of-range, or a failed dispatch.
                 defer self.releaseContextMenuSnapshot();
-                if (menu_event.item_index < count) {
-                    if (self.context_menu_shown_msgs[menu_event.item_index]) |msg| {
-                        // The Msg is stored by value and its pinned-arena
-                        // payload slices are consumed by `update` itself;
-                        // the rebuild that follows reads only the model.
-                        // Release the pin BEFORE the dispatch: nothing
-                        // resets the pinned arena until the rebuild, and
-                        // the rebuild then routes into the partner arena
-                        // naturally — so a Msg whose update pushes the
-                        // model past a build budget fails the rebuild
-                        // WITHOUT resetting the live arena underneath it.
-                        // Input keeps working on the previous tree, and
-                        // the app's controls can recover the model —
-                        // production's degraded-error contract.
-                        self.releaseContextMenuSnapshot();
-                        try self.dispatch(runtime, menu_event.window_id, msg);
-                        return;
-                    }
+                const msg = if (menu_event.item_index < count) self.context_menu_shown_msgs[menu_event.item_index] else null;
+                if (self.componentDecision(.selection_item, menu_event.item_index < count, msg != null, false) == 1) {
+                    // The Msg is stored by value and its pinned-arena
+                    // payload slices are consumed by `update` itself;
+                    // the rebuild that follows reads only the model.
+                    // Release the pin BEFORE the dispatch: nothing
+                    // resets the pinned arena until the rebuild, and
+                    // the rebuild then routes into the partner arena
+                    // naturally — so a Msg whose update pushes the
+                    // model past a build budget fails the rebuild
+                    // WITHOUT resetting the live arena underneath it.
+                    // Input keeps working on the previous tree, and
+                    // the app's controls can recover the model —
+                    // production's degraded-error contract.
+                    self.releaseContextMenuSnapshot();
+                    try self.dispatch(runtime, menu_event.window_id, msg.?);
+                    return;
                 }
                 // Swallowed without a Msg (out of range, or an item the
                 // presented tree never mapped): no dispatch rebuilds, so
@@ -6420,7 +6870,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             // failed while the model was unbuildable): the model may
             // have recovered since, so restore a dropped tree before
             // resolving rather than silently dispatching nothing.
-            if (self.treeForViewLabel(menu_event.view_label) == null) try self.restoreMissingTree(runtime);
+            if (self.componentDecision(.missing_tree, self.treeForViewLabel(menu_event.view_label) == null, false, false) != 0) try self.restoreMissingTree(runtime);
             const tree = self.treeForViewLabel(menu_event.view_label) orelse return;
             if (tree.msgForContextMenu(menu_event.target_id, menu_event.item_index)) |msg| {
                 try self.dispatch(runtime, menu_event.window_id, msg);
@@ -6450,9 +6900,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// being rebuilt, or 0 when the open fallback (if any) belongs to
         /// a different view.
         fn contextMenuFallbackTargetForLabel(self: *const Self, view_label: []const u8) canvas.ObjectId {
-            if (self.context_menu_fallback_target == 0) return 0;
-            if (!std.mem.eql(u8, view_label, self.contextMenuFallbackLabel())) return 0;
-            return self.context_menu_fallback_target;
+            return if (self.componentDecision(.fallback_label, self.context_menu_fallback_target != 0, std.mem.eql(u8, view_label, self.contextMenuFallbackLabel()), false) != 0) self.context_menu_fallback_target else 0;
         }
 
         fn clearContextMenuFallback(self: *Self) void {
@@ -6464,7 +6912,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// menu's open state lives here, not in the model, so opening and
         /// closing it re-derives the views directly.
         fn rebuildAllViews(self: *Self, runtime: *Runtime) anyerror!void {
-            if (!self.installed) return;
+            if (self.componentDecision(.rebuild_views, self.installed, false, false) == 0) return;
             try self.rebuild(runtime, self.canvas_window_id);
             try self.rebuildWindowSlots(runtime);
         }
@@ -6475,12 +6923,13 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// a native selection resolves. Returns true when the id was a
         /// fallback item (consumed either way).
         fn dispatchContextMenuFallbackItem(self: *Self, runtime: *Runtime, tree: *const Ui.Tree, window_id: platform.WindowId, id: canvas.ObjectId) anyerror!bool {
-            if (self.context_menu_fallback_target == 0) return false;
-            const fallback = tree.context_menu_fallback orelse return false;
-            const item_index = fallback.itemIndex(id) orelse return false;
+            const fallback = tree.context_menu_fallback;
+            const item_index = if (fallback) |value| value.itemIndex(id) else null;
+            if (self.componentDecision(.fallback_item, self.context_menu_fallback_target != 0, fallback != null, item_index != null) == 0) return false;
             self.clearContextMenuFallback();
-            if (tree.msgForContextMenu(fallback.target_id, item_index)) |msg| {
-                try self.dispatch(runtime, window_id, msg);
+            const msg = tree.msgForContextMenu(fallback.?.target_id, item_index.?);
+            if (self.componentDecision(.fallback_dispatch, msg != null, false, false) == 1) {
+                try self.dispatch(runtime, window_id, msg.?);
             } else {
                 try self.rebuildAllViews(runtime);
             }
@@ -6578,3 +7027,50 @@ const ContextMenuPin = struct {
     window_id: ?platform.WindowId,
     arena_index: usize,
 };
+
+fn effectsRestoreWindowResult(context: *anyopaque, label: []const u8, closed: bool) void {
+    const runtime: *Runtime = @ptrCast(@alignCast(context));
+    runtime.restoreWindowCapabilityResult(label, closed);
+}
+
+fn effectsExecuteCapability(context: *anyopaque, name: []const u8, payload: []const u8, output: []u8) anyerror![]const u8 {
+    const runtime: *Runtime = @ptrCast(@alignCast(context));
+    const desktop_files = @import("desktop_files.zig");
+    var reader = try desktop_files.request(payload);
+    if (std.mem.eql(u8, name, "native-sdk.window.focusResult") or std.mem.eql(u8, name, "native-sdk.window.closeResult")) {
+        const label = try reader.field();
+        try reader.finish();
+        if (label.len == 0 or label.len > 255 or std.mem.indexOfScalar(u8, label, 0) != null) return error.InvalidRequest;
+        const window_id = effectsWindowIdByLabel(runtime, label) orelse
+            return output[0..try desktop_files.replyHeaderFor(output, payload, "WindowNotFound")];
+        if (std.mem.eql(u8, name, "native-sdk.window.focusResult")) {
+            runtime.focusWindow(window_id) catch |err| return output[0..try desktop_files.replyHeaderFor(output, payload, @errorName(err))];
+        } else {
+            runtime.closeWindow(window_id) catch |err| return output[0..try desktop_files.replyHeaderFor(output, payload, @errorName(err))];
+        }
+        return output[0..try desktop_files.replyHeaderFor(output, payload, "")];
+    }
+    if (std.mem.eql(u8, name, "native-sdk.dialog.openDirectory")) {
+        if (!authorization.hasPermission(runtime.authorization_policy, runtime.options.security.permissions, security.permission_dialog)) return error.PermissionDenied;
+        const title = try reader.field();
+        const path = try reader.field();
+        try reader.finish();
+        if (title.len > 255 or path.len > desktop_files.max_path_bytes or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidRequest;
+        var storage: [platform.max_dialog_paths_bytes]u8 = undefined;
+        const result = runtime.showOpenDialog(.{ .title = title, .default_path = path, .allow_directories = true, .allow_multiple = false }, &storage) catch |err| {
+            return output[0..try desktop_files.replyHeaderFor(output, payload, @errorName(err))];
+        };
+        const selected = if (result.count == 0) "" else result.paths;
+        const header = try desktop_files.replyHeaderFor(output, payload, "");
+        if (selected.len > 65535 or output.len - header < 2 or selected.len > output.len - header - 2) return error.OverBound;
+        std.mem.writeInt(u16, output[header..][0..2], @intCast(selected.len), .little);
+        @memcpy(output[header + 2 ..][0..selected.len], selected);
+        return output[0 .. header + 2 + selected.len];
+    }
+    if (!authorization.hasPermission(runtime.authorization_policy, runtime.options.security.permissions, security.permission_filesystem)) return error.PermissionDenied;
+    if (comptime builtin.os.tag == .macos or builtin.os.tag == .linux or builtin.os.tag == .windows) {
+        var threaded = std.Io.Threaded.init(runtime.owned_allocator, .{});
+        defer threaded.deinit();
+        return desktop_files.execute(threaded.io(), name, payload, output);
+    } else return error.Unsupported;
+}

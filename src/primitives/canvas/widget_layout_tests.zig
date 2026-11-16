@@ -1729,6 +1729,20 @@ test "widget focus traversal skips scroll clipped children" {
     try std.testing.expect(layout.focusTargetById(4) == null);
 }
 
+// BEGIN wheel-ease patch (zig-nostr/native)
+test "a wheel ease shorter than the duration floor does not assert" {
+    const axis = ScrollAxisState{ .offset = 0, .viewport_extent = 100, .content_extent = 1000 };
+    const first = axis.wheelEase(.{}, 40, .{ .wheel_ease_ms = 10 }, 1_000_000_000).?;
+    try std.testing.expectEqual(@as(u32, 10), first.duration_ms);
+    // A second notch 3ms later: twice the gap is below every floor, and the
+    // result is bounded by the token rather than the 50ms default floor.
+    const second = axis.wheelEase(first, 40, .{ .wheel_ease_ms = 10 }, 1_003_000_000).?;
+    try std.testing.expectEqual(@as(u32, 10), second.duration_ms);
+    const tiny = axis.wheelEase(first, 40, .{ .wheel_ease_ms = 1 }, 1_003_000_000).?;
+    try std.testing.expectEqual(@as(u32, 1), tiny.duration_ms);
+}
+// END wheel-ease patch
+
 test "scroll state applies wheel deltas kinetic decay and bounds" {
     const physics = ScrollPhysics{
         .wheel_multiplier = 2,
@@ -2825,6 +2839,10 @@ test "widget focus target lookup validates focusable ids" {
     try std.testing.expect(layout.focusTargetById(4) == null);
     try std.testing.expect(layout.focusTargetById(99) == null);
 
+    for (layout.nodes, 0..) |node, index| {
+        try std.testing.expectEqualDeep(layout.focusTargetById(node.widget.id), layout.focusTargetAtIndex(index));
+    }
+    try std.testing.expect(layout.focusTargetAtIndex(layout.nodes.len) == null);
     const target = layout.focusTargetById(3).?;
     try std.testing.expectEqual(@as(ObjectId, 3), target.id);
     try std.testing.expectEqual(WidgetKind.button, target.kind);

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const geometry = @import("geometry");
 const canvas = @import("root.zig");
 const drawing_model = @import("drawing.zig");
@@ -115,6 +116,7 @@ pub const ReferenceFont = struct {
 };
 
 pub const ReferenceRenderSurface = struct {
+    vector_policy: ?@import("vector_raster_policy.zig").Policy = null,
     width: usize,
     height: usize,
     pixels: []u8,
@@ -128,6 +130,10 @@ pub const ReferenceRenderSurface = struct {
     /// instead of re-running its pixel loop. Same bytes either way —
     /// this only moves time.
     render_memo: ?*ReferenceRenderMemo = null,
+    /// True when a text measure function installed on the runtime can enter
+    /// the compiled TypeScript core, which is entered from one thread. Keeps
+    /// the pass off the worker pool.
+    serial_measure: bool = false,
 
     pub fn init(width: usize, height: usize, pixels: []u8) Error!ReferenceRenderSurface {
         const len = std.math.mul(usize, std.math.mul(usize, width, height) catch return error.ReferenceRenderSurfaceTooSmall, 4) catch return error.ReferenceRenderSurfaceTooSmall;
@@ -163,6 +169,12 @@ pub const ReferenceRenderSurface = struct {
     /// Attach a render memo that outlives this render pass (one per
     /// live scene). Purely an optimization: output bytes are identical
     /// with or without it.
+    pub fn withSerialMeasure(self: ReferenceRenderSurface, serial: bool) ReferenceRenderSurface {
+        var next = self;
+        next.serial_measure = serial;
+        return next;
+    }
+
     pub fn withRenderMemo(self: ReferenceRenderSurface, memo: ?*ReferenceRenderMemo) ReferenceRenderSurface {
         var next = self;
         next.render_memo = memo;
@@ -280,8 +292,209 @@ pub const ReferenceRenderSurface = struct {
             .clear => self.clear(clear_color),
             .load => if (scissor) |bounds| self.clearRect(bounds, clear_color),
         }
+        var owned = self;
+        owned.vector_policy = pass.gpu_plan_policy;
+        // BEGIN banded-raster patch (zig-nostr/native)
+        // Rows are split across cores when it is provably safe to do so. The
+        // machine this matters on has four and uses one.
+        if (referenceBandPlan(owned, pass)) |bands| {
+            return owned.renderPassBanded(pass, scale, scissor, bands);
+        }
+        // END banded-raster patch
+        for (pass.commands) |command| try owned.renderCommand(referenceScaleCommand(command, scale), scissor);
+    }
+
+    // BEGIN banded-raster patch (zig-nostr/native)
+    /// How many row bands this pass may be split into, or null to stay on one
+    /// thread. Four conditions, each of which is a real hazard rather than
+    /// caution.
+    ///
+    /// NO BLUR. `drawBlur` copies the entire surface into scratch and gathers
+    /// through a kernel apron, so it reads rows other bands own and does so
+    /// mid-pass. Every other command reads only the pixel it writes. A pass
+    /// carrying one stays sequential, whole.
+    ///
+    /// NO RENDER MEMO. It is shared mutable state across the whole surface. It
+    /// is null on every desktop host (only the mobile embed host wires one), so
+    /// this costs nothing where it is wanted.
+    ///
+    /// NO COMPILED VECTOR POLICY. Path, stroke and glyph fills call into it,
+    /// and it is the app's compiled TypeScript core: one heap and one result
+    /// buffer, entered from one thread. A pass that carries a policy stays
+    /// sequential, whole. Apps with a Zig core leave it null.
+    ///
+    /// NO COMPILED TEXT MEASURE. When the runtime carries a compiled core,
+    /// text measurement during a draw can enter it (`serial_measure`), under
+    /// the same one-thread rule. Zig-core apps leave it false and band.
+    ///
+    /// AND ENOUGH ROWS TO BE WORTH IT. Bands below a few dozen rows spend more
+    /// on the spawn than they save.
+    fn referenceBandPlan(self: ReferenceRenderSurface, pass: CanvasRenderPass) ?usize {
+        // A single-threaded target (the wasm docs preview) cannot spawn, so it
+        // never bands and the pool is never analysed for it.
+        if (comptime builtin.single_threaded) return null;
+        if (self.render_memo != null) return null;
+        if (self.vector_policy != null) return null;
+        if (self.height < min_reference_band_rows * 2) return null;
+        for (pass.commands) |command| {
+            if (command.command == .blur) return null;
+        }
+        if (self.serial_measure) return null;
+        const cores = cpuCount();
+        if (cores < 2) return null;
+        const by_rows = self.height / min_reference_band_rows;
+        const bands = @min(@min(cores, max_reference_bands), by_rows);
+        return if (bands >= 2) bands else null;
+    }
+
+    /// One band's share of the pass: the same commands, in the same order,
+    /// against a scissor narrowed to its rows.
+    ///
+    /// Output is identical to the single-threaded pass, and that is a
+    /// consequence of the scissor contract rather than a hope. Every primitive
+    /// derives its writes from `referenceCommandBounds(command, scissor)` and
+    /// then `referencePixelRect`, so a band writes exactly the pixels the whole
+    /// pass would have written in those rows, and never a pixel outside them.
+    /// Bands own disjoint rows, so the threads never touch the same byte.
+    fn renderBandThread(self: ReferenceRenderSurface, pass: CanvasRenderPass, scale: f32, scissor: ?geometry.RectF, y0: usize, y1: usize, slot: *?Error) void {
+        const band = geometry.RectF.init(
+            0,
+            @floatFromInt(y0),
+            @floatFromInt(self.width),
+            @floatFromInt(y1 - y0),
+        );
+        const band_scissor = if (scissor) |outer| geometry.RectF.intersection(outer, band) else band;
+        if (band_scissor.isEmpty()) return;
+        for (pass.commands) |command| {
+            self.renderCommand(referenceScaleCommand(command, scale), band_scissor) catch |err| {
+                slot.* = err;
+                return;
+            };
+        }
+    }
+
+    fn renderPassBanded(self: ReferenceRenderSurface, pass: CanvasRenderPass, scale: f32, scissor: ?geometry.RectF, planned_bands: usize) Error!void {
+        if (comptime builtin.single_threaded) return self.renderSequential(pass, scale, scissor);
+        // Every path renders every row exactly once. When the pool cannot be
+        // had (disabled, still busy with another pass, or no worker could be
+        // started) the whole pass runs here, sequentially.
+        const workers = BandPool.acquire() orelse return self.renderSequential(pass, scale, scissor);
+        defer BandPool.release();
+        const bands = @min(planned_bands, workers + 1);
+        if (bands < 2) return self.renderSequential(pass, scale, scissor);
+
+        var errors: [max_reference_bands]?Error = @splat(null);
+        const rows = self.height / bands;
+        BandPool.run(self, pass, scale, scissor, rows, bands, &errors);
+        // The last band runs on THIS thread, and takes any remainder rows.
+        renderBandThread(self, pass, scale, scissor, (bands - 1) * rows, self.height, &errors[bands - 1]);
+        BandPool.finish(bands - 1);
+        for (errors[0..bands]) |maybe| if (maybe) |err| return err;
+    }
+
+    fn renderSequential(self: ReferenceRenderSurface, pass: CanvasRenderPass, scale: f32, scissor: ?geometry.RectF) Error!void {
         for (pass.commands) |command| try self.renderCommand(referenceScaleCommand(command, scale), scissor);
     }
+
+    /// Test hook: false makes `acquire` report no pool, which is the path a
+    /// failed worker spawn takes.
+    pub var band_pool_enabled: bool = true;
+
+    var cached_cpu_count: std.atomic.Value(usize) = .init(0);
+
+    fn cpuCount() usize {
+        const known = cached_cpu_count.load(.monotonic);
+        if (known != 0) return known;
+        const count = std.Thread.getCpuCount() catch 1;
+        cached_cpu_count.store(count, .monotonic);
+        return count;
+    }
+
+    /// A persistent set of worker threads, created once per process on first
+    /// use. Each worker owns its thread-local glyph scratch for its whole
+    /// life, so that scratch is allocated once per worker and reused every
+    /// frame, instead of once per spawned thread per frame.
+    const BandPool = struct {
+        const worker_stack_bytes: usize = 4 * 1024 * 1024;
+        const Job = struct {
+            surface: ReferenceRenderSurface,
+            pass: CanvasRenderPass,
+            scale: f32,
+            scissor: ?geometry.RectF,
+            rows: usize,
+            errors: *[max_reference_bands]?Error,
+        };
+        /// 0 not started, 1 starting, 2 ready, 3 unavailable.
+        var state: std.atomic.Value(u32) = .init(0);
+        var busy: std.atomic.Value(bool) = .init(false);
+        var worker_count: usize = 0;
+        var wake: [max_reference_bands - 1]std.Io.Semaphore = @splat(.{});
+        var done: std.Io.Semaphore = .{};
+        var job: Job = undefined;
+
+        fn io() std.Io {
+            return std.Io.Threaded.global_single_threaded.io();
+        }
+
+        /// The worker count if this thread now owns the pool, else null.
+        fn acquire() ?usize {
+            if (!band_pool_enabled) return null;
+            if (state.load(.acquire) == 3) return null;
+            if (busy.cmpxchgStrong(false, true, .acquire, .monotonic) != null) return null;
+            if (state.load(.acquire) == 0) {
+                state.store(1, .monotonic);
+                start();
+            }
+            if (state.load(.acquire) != 2) {
+                busy.store(false, .release);
+                return null;
+            }
+            return worker_count;
+        }
+
+        fn release() void {
+            busy.store(false, .release);
+        }
+
+        fn start() void {
+            const want = @min(cpuCount(), max_reference_bands) -| 1;
+            var started: usize = 0;
+            while (started < want) : (started += 1) {
+                const thread = std.Thread.spawn(.{ .stack_size = worker_stack_bytes }, workerMain, .{started}) catch break;
+                thread.detach();
+            }
+            worker_count = started;
+            state.store(if (started >= 1) 2 else 3, .release);
+        }
+
+        fn workerMain(index: usize) void {
+            while (true) {
+                wake[index].waitUncancelable(io());
+                const j = job;
+                const y0 = index * j.rows;
+                renderBandThread(j.surface, j.pass, j.scale, j.scissor, y0, y0 + j.rows, &j.errors[index]);
+                done.post(io());
+            }
+        }
+
+        /// Hand bands 0..bands-2 to workers 0..bands-2.
+        fn run(surface: ReferenceRenderSurface, pass: CanvasRenderPass, scale: f32, scissor: ?geometry.RectF, rows: usize, bands: usize, errors: *[max_reference_bands]?Error) void {
+            job = .{ .surface = surface, .pass = pass, .scale = scale, .scissor = scissor, .rows = rows, .errors = errors };
+            for (wake[0 .. bands - 1]) |*sem| sem.post(io());
+        }
+
+        fn finish(count: usize) void {
+            var left = count;
+            while (left > 0) : (left -= 1) done.waitUncancelable(io());
+        }
+    };
+
+    /// Fewer rows than this and a band costs more to start than it saves.
+    const min_reference_band_rows: usize = 64;
+    /// More bands than this and the shares get small enough that the spawn
+    /// dominates on the machines this targets.
+    const max_reference_bands: usize = 8;
+    // END banded-raster patch
 
     pub fn pixelRgba8(self: ReferenceRenderSurface, x: usize, y: usize) [4]u8 {
         if (x >= self.width or y >= self.height) return .{ 0, 0, 0, 0 };
@@ -318,6 +531,31 @@ pub const ReferenceRenderSurface = struct {
         // the pixel it writes, so no apron rows join the key.
         const probe = self.memoProbe(pixel_rect, 0, referenceMemoParamsHash(1, command, value));
         if (self.memoReplay(probe, pixel_rect)) return;
+        // BEGIN opaque-coverage patch (zig-nostr/native)
+        // A solid colour samples the same everywhere, so the per-pixel
+        // `referenceSampleFill` call and its switch are loop-invariant; and
+        // when that colour is opaque the blend is a store. Together the inner
+        // loop of a background fill becomes four byte writes.
+        const constant_opaque: ?[4]u8 = switch (value.fill) {
+            .color => |color| referenceOpaqueBytes(color, command.opacity),
+            .linear_gradient => null,
+        };
+        if (constant_opaque) |bytes| {
+            var oy = pixel_rect.y;
+            while (oy < pixel_rect.y + pixel_rect.height) : (oy += 1) {
+                var ox = pixel_rect.x;
+                while (ox < pixel_rect.x + pixel_rect.width) : (ox += 1) {
+                    const index = (@as(usize, @intCast(oy)) * self.width + @as(usize, @intCast(ox))) * 4;
+                    self.pixels[index + 0] = bytes[0];
+                    self.pixels[index + 1] = bytes[1];
+                    self.pixels[index + 2] = bytes[2];
+                    self.pixels[index + 3] = bytes[3];
+                }
+            }
+            self.memoStore(probe, pixel_rect);
+            return;
+        }
+        // END opaque-coverage patch
         var y = pixel_rect.y;
         while (y < pixel_rect.y + pixel_rect.height) : (y += 1) {
             var x = pixel_rect.x;
@@ -342,17 +580,81 @@ pub const ReferenceRenderSurface = struct {
         // test (bit-identical on integer bounds); rounded fills take
         // the anti-aliased signed-distance coverage.
         const binary = referenceRadiusIsZero(radius);
+        // BEGIN opaque-coverage patch (zig-nostr/native)
+        // Square corners reduce to a plain containment test, and the whole of
+        // `referencePointInRoundedRect` is dead weight for them: with every
+        // radius zero, each of its four corner branches needs a point either
+        // left of `minX` or at/past `maxX`, and `containsPoint` has already
+        // excluded both, so it always falls through to `return true`. What is
+        // left is the containment test itself.
+        //
+        // It was running per pixel, and taking `rect.normalized()` with it:
+        // a rect construction, four clamps and eight comparisons for every
+        // pixel of every square fill. This app draws its full-size
+        // backgrounds as radius-0 rounded rects, so that is most of the
+        // pixels on screen, and `present` is 79% of a scroll frame.
+        //
+        // Hoisted, not replaced by a span: deriving the covered pixel span
+        // from the geometric rect means reproducing the pixel-center
+        // comparisons exactly, and getting that subtly wrong moves golden
+        // bytes. This form cannot: it is the same predicate, evaluated the
+        // same number of times, with the loop-invariant part lifted out.
+        const square_rect = if (binary) rect.normalized() else rect;
+        // And the same two reductions the plain rect fill takes: a solid
+        // colour is loop-invariant, and an opaque one makes the blend a
+        // store. This is the path Plaza's full-size backgrounds run down.
+        const square_opaque: ?[4]u8 = if (!binary) null else switch (value.fill) {
+            .color => |color| referenceOpaqueBytes(color, command.opacity),
+            .linear_gradient => null,
+        };
+        if (square_opaque) |bytes| {
+            var oy = pixel_rect.y;
+            while (oy < pixel_rect.y + pixel_rect.height) : (oy += 1) {
+                var ox = pixel_rect.x;
+                while (ox < pixel_rect.x + pixel_rect.width) : (ox += 1) {
+                    if (!square_rect.containsPoint(referencePixelCenter(ox, oy))) continue;
+                    const index = (@as(usize, @intCast(oy)) * self.width + @as(usize, @intCast(ox))) * 4;
+                    self.pixels[index + 0] = bytes[0];
+                    self.pixels[index + 1] = bytes[1];
+                    self.pixels[index + 2] = bytes[2];
+                    self.pixels[index + 3] = bytes[3];
+                }
+            }
+            self.memoStore(probe, pixel_rect);
+            return;
+        }
+        // END opaque-coverage patch
         var y = pixel_rect.y;
         while (y < pixel_rect.y + pixel_rect.height) : (y += 1) {
             var x = pixel_rect.x;
             while (x < pixel_rect.x + pixel_rect.width) : (x += 1) {
                 const point = referencePixelCenter(x, y);
                 if (binary) {
-                    if (referencePointInRoundedRect(point, rect, radius)) self.blendPixel(@intCast(x), @intCast(y), referenceSampleFill(value.fill, command.transform, point), command.opacity);
+                    if (square_rect.containsPoint(point)) self.blendPixel(@intCast(x), @intCast(y), referenceSampleFill(value.fill, command.transform, point), command.opacity);
                     continue;
                 }
+                // BEGIN opaque-coverage patch (zig-nostr/native)
+                // A fully covered pixel takes the plain blend directly.
+                //
+                // This is not an approximation. `blendRgba8Coverage` already
+                // returns `blendRgba8(dst, referenceScaleColorAlpha(src, cov),
+                // opacity)` whenever `cov >= 1`, and scaling an alpha by
+                // exactly 1.0 is identity in IEEE754, so the two paths land on
+                // the same bytes for every input. Hoisting the test only saves
+                // reaching that answer through a call the interior of every
+                // rounded fill pays per pixel.
+                //
+                // It is worth doing because `present` is 79% of a scroll frame
+                // on the software renderer, and fills are most of `present`.
+                // The corners still take the anti-aliased path, which is the
+                // only place coverage is actually fractional.
                 const coverage = referenceRoundedRectCoverage(point, rect, radius);
-                if (coverage > 0) self.blendPixelCoverage(@intCast(x), @intCast(y), referenceSampleFill(value.fill, command.transform, point), coverage, command.opacity, .linear_light);
+                if (coverage >= 1) {
+                    self.blendPixel(@intCast(x), @intCast(y), referenceSampleFill(value.fill, command.transform, point), command.opacity);
+                } else if (coverage > 0) {
+                    self.blendPixelCoverage(@intCast(x), @intCast(y), referenceSampleFill(value.fill, command.transform, point), coverage, command.opacity, .linear_light);
+                }
+                // END opaque-coverage patch
             }
         }
         self.memoStore(probe, pixel_rect);
@@ -395,9 +697,13 @@ pub const ReferenceRenderSurface = struct {
                     continue;
                 }
                 const coverage = std.math.clamp(referenceRoundedRectCoverage(point, outer, outer_radius) - referenceRoundedRectCoverage(point, inner, inner_radius), 0, 1);
-                if (coverage > 0) {
+                // BEGIN opaque-coverage patch (zig-nostr/native)
+                if (coverage >= 1) {
+                    self.blendPixel(@intCast(x), @intCast(y), referenceSampleFill(value.stroke.fill, command.transform, point), command.opacity);
+                } else if (coverage > 0) {
                     self.blendPixelCoverage(@intCast(x), @intCast(y), referenceSampleFill(value.stroke.fill, command.transform, point), coverage, command.opacity, .linear_light);
                 }
+                // END opaque-coverage patch
             }
         }
         self.memoStore(probe, pixel_rect);
@@ -434,13 +740,14 @@ pub const ReferenceRenderSurface = struct {
             .opacity = command.opacity,
             .coverage_blend = .linear_light,
         };
-        vector.fillPath(
+        vector.fillPathWithPolicy(
             value.elements,
             command.transform,
             .even_odd,
             vector.default_tolerance,
             referenceVectorClip(pixel_rect),
             &sink,
+            self.vector_policy,
         ) catch return error.ReferenceRenderUnsupportedCommand;
     }
 
@@ -462,13 +769,14 @@ pub const ReferenceRenderSurface = struct {
             .opacity = command.opacity,
             .coverage_blend = .linear_light,
         };
-        vector.strokePath(
+        vector.strokePathWithPolicy(
             value.elements,
             command.transform,
             .{ .width = stroke_width, .cap = value.cap, .join = .round },
             vector.default_tolerance,
             referenceVectorClip(pixel_rect),
             &sink,
+            self.vector_policy,
         ) catch return error.ReferenceRenderUnsupportedCommand;
     }
 
@@ -839,6 +1147,54 @@ pub const ReferenceRenderSurface = struct {
         self.fillTextRect(command.transform.transformRect(block_rect).normalized(), draw_bounds, value.color, command.opacity);
     }
 
+    // BEGIN colour-emoji patch
+    /// Inks one `COLR` v0 glyph, bottom layer first. True when anything was
+    /// drawn; false hands the glyph back to the monochrome path.
+    fn drawColorGlyph(
+        self: ReferenceRenderSurface,
+        command: RenderCommand,
+        value: DrawText,
+        draw_bounds: geometry.RectF,
+        face: *const font_ttf.Face,
+        glyph: u16,
+        layer_count: u16,
+        total: Affine,
+    ) bool {
+        const pixel_rect = referencePixelRect(draw_bounds, self.width, self.height) orelse return true;
+        var drew = false;
+        var index: u16 = 0;
+        while (index < layer_count) : (index += 1) {
+            const layer = face.colorLayer(glyph, index) orelse continue;
+            var builder = vector.PathBuilder(reference_glyph_path_capacity){};
+            face.glyphOutline(layer.glyph, total, &builder) catch continue;
+            if (builder.slice().len == 0) continue;
+            const colour = if (layer.use_text_color)
+                value.color
+            else
+                canvas.Color.rgba8(layer.r, layer.g, layer.b, layer.a);
+            var sink = ReferenceCoverageSink{
+                .surface = self,
+                .fill = .{ .color = colour },
+                .transform = command.transform,
+                .opacity = command.opacity,
+                .coverage_blend = .srgb,
+            };
+            vector.fillGlyphPathWithPolicy(
+                &reference_glyph_raster_scratch.get().raster,
+                builder.slice(),
+                Affine.identity(),
+                .nonzero,
+                vector.default_tolerance,
+                referenceVectorClip(pixel_rect),
+                &sink,
+                self.vector_policy,
+            ) catch continue;
+            drew = true;
+        }
+        return drew;
+    }
+    // END colour-emoji patch
+
     /// True when the glyph was handled (drawn, or intentionally empty
     /// like a space); false requests the block fallback.
     fn drawGlyphOutline(
@@ -851,9 +1207,12 @@ pub const ReferenceRenderSurface = struct {
         baseline: f32,
         cell_advance: f32,
     ) bool {
-        const face = referenceFaceForFontId(self.fonts, value.font_id);
-        const glyph = face.glyphIndex(codepoint);
-        if (glyph == 0) return false;
+        // Colour-emoji patch: the face that HAS the codepoint, which is the
+        // requested one for ordinary text and a registered emoji face for a
+        // picture the text face never carried.
+        const found = referenceGlyphFor(self.fonts, value.font_id, codepoint) orelse return false;
+        const face = found.face;
+        const glyph = found.glyph;
 
         // Center the outline's natural advance inside its layout cell when
         // the cell is wider. With the bundled mono face this is the
@@ -861,14 +1220,39 @@ pub const ReferenceRenderSurface = struct {
         // cell layout charges, so inset 0), and sans cells equal their
         // natural advance too — the inset stays for any future face whose
         // ink runs narrower than its layout cell.
-        const natural_advance = value.size * (face.advance(glyph) / face.units_per_em);
+        var scale = value.size / face.units_per_em;
+        var natural_advance = value.size * (face.advance(glyph) / face.units_per_em);
+        // Colour-emoji patch: a FALLBACK glyph is fitted to the cell layout
+        // already charged for it. Measurement never saw the fallback face, so
+        // it billed the codepoint from the text face's estimator, and for the
+        // BMP symbol range U+2190..U+2BFF (hearts, dingbats, arrows) that is
+        // the 0.8 em pictograph class while an emoji face draws a full 1.0 em.
+        // Inking it unscaled would spill a quarter of a cell over the next
+        // character. Shrinking to the reserved cell keeps ink and layout in
+        // agreement without teaching the metrics module about a second face.
+        //
+        // The ASTRAL planes are already billed 1.0 em by the same estimator
+        // (isEastAsianWideCodepoint, text_metrics.zig), so most emoji reach
+        // this with natural_advance == cell_advance and pass through
+        // untouched. That is why the guard is a comparison and not a constant.
+        if (found.fallback and cell_advance > 0 and natural_advance > cell_advance) {
+            scale *= cell_advance / natural_advance;
+            natural_advance = cell_advance;
+        }
         const cell_inset = @max(0, (cell_advance - natural_advance) * 0.5);
-
-        const scale = value.size / face.units_per_em;
         // Font units are y-up; bake the flip and em scaling into the pen
         // placement, then apply the command transform on top.
         const local = Affine{ .a = scale, .b = 0, .c = 0, .d = -scale, .tx = pen_x + cell_inset, .ty = baseline };
         const total = command.transform.multiply(local);
+
+        // BEGIN colour-emoji patch: a COLR glyph is a STACK of outlines, each
+        // with its own palette colour, so it is inked layer by layer rather
+        // than once in the text colour. Monochrome glyphs skip all of this.
+        const layer_count = face.colorLayerCount(glyph);
+        if (layer_count > 0) {
+            if (self.drawColorGlyph(command, value, draw_bounds, face, glyph, layer_count, total)) return true;
+        }
+        // END colour-emoji patch
 
         var builder = vector.PathBuilder(reference_glyph_path_capacity){};
         face.glyphOutline(glyph, total, &builder) catch return false;
@@ -893,14 +1277,16 @@ pub const ReferenceRenderSurface = struct {
         // fallback triggers are a clip band wider than
         // `max_raster_width` (surface-shaped, not font-shaped) and
         // nothing else.
-        vector.fillGlyphPath(
-            &reference_glyph_raster_scratch.get().raster,
+        const raster = &reference_glyph_raster_scratch.get().raster;
+        vector.fillGlyphPathWithPolicy(
+            raster,
             builder.slice(),
             Affine.identity(),
             .nonzero,
             vector.default_tolerance,
             referenceVectorClip(pixel_rect),
             &sink,
+            self.vector_policy,
         ) catch return false;
         return true;
     }
@@ -1000,6 +1386,14 @@ const ReferenceCoverageSink = struct {
         if (px >= self.surface.width or py >= self.surface.height) return;
         const point = referencePixelCenter(px, py);
         const color = referenceSampleFill(self.fill, self.transform, point);
+        // BEGIN opaque-coverage patch (zig-nostr/native)
+        // Same identity as the rounded fills above. The interior of any
+        // filled path, glyph included, is fully covered.
+        if (coverage >= 1) {
+            self.surface.blendPixel(px, py, color, self.opacity);
+            return;
+        }
+        // END opaque-coverage patch
         self.surface.blendPixelCoverage(px, py, color, coverage, self.opacity, self.coverage_blend);
     }
 };
@@ -1128,7 +1522,6 @@ fn referenceScaleRect(rect: geometry.RectF, scale: f32) geometry.RectF {
     return geometry.RectF.init(rect.x * scale, rect.y * scale, rect.width * scale, rect.height * scale);
 }
 
-
 fn referencePixelCenter(x: usize, y: usize) geometry.PointF {
     return geometry.PointF.init(@as(f32, @floatFromInt(x)) + 0.5, @as(f32, @floatFromInt(y)) + 0.5);
 }
@@ -1147,9 +1540,8 @@ fn isReferenceTextSpace(byte: u8) bool {
 /// The face a run's font id inks with: a runtime-registered face when
 /// the id matches one (validated at registration, so a registered id
 /// always resolves — no render-time fallback decision), otherwise the
-/// bundled mapping — the mono face for the reserved mono id, the sans
-/// face for everything else (the weight and italic span variants keep
-/// the regular outlines at their estimator advances, exactly as before).
+/// bundled mapping — Geist Mono for mono text, and the corresponding
+/// regular, medium or bold Geist face for reserved sans ids.
 /// Glyphs missing from whichever face wins keep the per-glyph notdef
 /// block fallback in `drawGlyphBox`; a registered face never cascades
 /// into the bundled faces mid-run.
@@ -1157,9 +1549,58 @@ fn referenceFaceForFontId(fonts: []const ReferenceFont, font_id: canvas.FontId) 
     for (fonts) |font| {
         if (font.id == font_id) return font.face;
     }
-    if (font_id == canvas.default_mono_font_id) return &font_ttf.geist_mono;
-    return &font_ttf.geist_regular;
+    return font_ttf.bundledFaceForFontId(font_id);
 }
+
+// BEGIN colour-emoji patch (zig-nostr/native, see vercel-labs/native#421)
+
+/// The face that actually HAS this codepoint, and its glyph.
+///
+/// The face a font id names is asked first and wins whenever it maps the
+/// codepoint, so a font id still means the face it names and ordinary text is
+/// untouched. The fallback is deliberately narrow: only a registered face that
+/// carries `COLR` gets a second look, and only for a codepoint the named face
+/// has no glyph for.
+///
+/// Any registered face may lend, not only a colour one.
+///
+/// This started narrow: only a face carrying `COLR` got a second look, on the
+/// reasoning that a colour face has no monochrome text to lend, so admitting
+/// only those adds emoji without letting one font id draw with another's
+/// outlines. That reasoning holds, and it is also the whole problem. Off macOS
+/// there is no platform text provider, so the bundled faces are the only glyph
+/// source, and they carry Latin and Cyrillic. Every other script, Greek, CJK,
+/// Japanese, Korean, Arabic, Hebrew, Thai, Devanagari, has no glyph anywhere
+/// and is painted as a solid block. An app cannot fix that from outside,
+/// because a face it registers is only ever consulted for its own id.
+///
+/// So the gate is coverage, not colour: the named face is asked first and
+/// still wins every codepoint it has, and a registered face is consulted only
+/// for a codepoint nothing else could draw. Registration order decides between
+/// two faces that both carry it.
+///
+/// The cost is the property this once pinned: a font id can now draw one
+/// codepoint with another face's outlines. That is the point, and it is
+/// bounded to codepoints the named face does not have at all, where the
+/// alternative is not "the right face" but a filled rectangle.
+fn referenceGlyphFor(
+    fonts: []const ReferenceFont,
+    font_id: canvas.FontId,
+    codepoint: u21,
+) ?struct { face: *const font_ttf.Face, glyph: u16, fallback: bool } {
+    const primary = referenceFaceForFontId(fonts, font_id);
+    const direct = primary.glyphIndex(codepoint);
+    if (direct != 0) return .{ .face = primary, .glyph = direct, .fallback = false };
+
+    for (fonts) |font| {
+        if (font.face == primary) continue;
+        const glyph = font.face.glyphIndex(codepoint);
+        if (glyph != 0) return .{ .face = font.face, .glyph = glyph, .fallback = true };
+    }
+    return null;
+}
+
+// END colour-emoji patch
 
 /// Decode the first codepoint of the cluster `text[start..start+len]`;
 /// null when the draw carries no text bytes for the glyph (pure glyph-id
@@ -1676,6 +2117,33 @@ fn rgba8ToColor(pixel: [4]u8) Color {
         @as(f32, @floatFromInt(pixel[3])) / 255.0,
     );
 }
+
+// BEGIN opaque-coverage patch (zig-nostr/native)
+/// The exact bytes `blendRgba8` produces when the source is fully opaque,
+/// or null when it is not and the destination still matters.
+///
+/// Not an approximation, and worth spelling out because it is the whole
+/// justification for skipping the read. With `src_a == 1`, `out_a` is
+/// `1 + dst_a * 0` = 1, and each channel is
+/// `(clamp(src.c) * 1 + dst_c * dst_a * 0) / 1`. Multiplying and dividing by
+/// exactly 1.0 is identity in IEEE754, so every output byte is a function of
+/// the source alone. The destination is not merely unlikely to matter, it is
+/// arithmetically absent.
+///
+/// What it buys: a read-modify-write of four bytes becomes a write, on a
+/// software rasteriser where `present` is 79% of a scroll frame and fills are
+/// most of it.
+fn referenceOpaqueBytes(src: Color, opacity: f32) ?[4]u8 {
+    const src_a = std.math.clamp(src.a * std.math.clamp(opacity, 0, 1), 0, 1);
+    if (src_a < 1) return null;
+    return .{
+        colorChannelToByte(std.math.clamp(src.r, 0, 1)),
+        colorChannelToByte(std.math.clamp(src.g, 0, 1)),
+        colorChannelToByte(std.math.clamp(src.b, 0, 1)),
+        colorChannelToByte(1),
+    };
+}
+// END opaque-coverage patch
 
 fn blendRgba8(dst: [4]u8, src: Color, opacity: f32) [4]u8 {
     const src_a = std.math.clamp(src.a * std.math.clamp(opacity, 0, 1), 0, 1);
